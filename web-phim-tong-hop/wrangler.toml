@@ -1,3 +1,2 @@
 # Cấu hình Cloudflare Pages (đọc bởi Pages CI khi deploy từ Git)
-name = "phim-tong-hop"
 pages_build_output_dir = "dist"

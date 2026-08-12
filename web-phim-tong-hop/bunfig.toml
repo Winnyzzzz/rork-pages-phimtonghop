@@ -1,0 +1,4 @@
+# Buộc bun ghi khóa dạng nhị phân (bun.lockb)
+# vì Cloudflare Pages chỉ nhận diện bun.lockb, không nhận bun.lock dạng text.
+[install]
+saveTextLockfile = false
