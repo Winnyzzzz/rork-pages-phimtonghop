@@ -1,2 +1,0 @@
-# Cấu hình Cloudflare Pages (đọc bởi Pages CI khi deploy từ Git)
-pages_build_output_dir = "dist"
