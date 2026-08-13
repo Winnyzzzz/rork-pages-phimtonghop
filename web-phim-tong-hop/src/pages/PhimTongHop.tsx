@@ -146,7 +146,7 @@ export default function PhimTongHop() {
     const cardId = `${item.source}:${item.slug}`;
     saveListPosition(scope, cardId, window.scrollY);
     navigate(
-      `/phimtonghop/${encodeURIComponent(item.slug)}?from=${item.source}&back=${page}&q=${encodeURIComponent(q)}&category=${encodeURIComponent(category)}&country=${encodeURIComponent(country)}&year=${encodeURIComponent(year)}&source=${source}`,
+      `/phim/${encodeURIComponent(item.slug)}?from=${item.source}&back=${page}&q=${encodeURIComponent(q)}&category=${encodeURIComponent(category)}&country=${encodeURIComponent(country)}&year=${encodeURIComponent(year)}&source=${source}`,
     );
   };
 
@@ -223,7 +223,7 @@ export default function PhimTongHop() {
           return (
             <Link
               key={cardId}
-              to={`/phimtonghop/${encodeURIComponent(item.slug)}?from=${item.source}&back=${page}&q=${encodeURIComponent(q)}&category=${encodeURIComponent(category)}&country=${encodeURIComponent(country)}&year=${encodeURIComponent(year)}&source=${source}`}
+              to={`/phim/${encodeURIComponent(item.slug)}?from=${item.source}&back=${page}&q=${encodeURIComponent(q)}&category=${encodeURIComponent(category)}&country=${encodeURIComponent(country)}&year=${encodeURIComponent(year)}&source=${source}`}
               data-card-id={cardId}
               onClick={(e) => {
                 e.preventDefault();

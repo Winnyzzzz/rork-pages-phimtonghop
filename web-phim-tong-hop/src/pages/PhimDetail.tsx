@@ -178,7 +178,7 @@ export default function PhimDetail() {
     });
   };
 
-  const backHref = `/phimtonghop?source=${source}&page=${back}&q=${encodeURIComponent(q)}&category=${encodeURIComponent(category)}&country=${encodeURIComponent(country)}&year=${encodeURIComponent(year)}`;
+  const backHref = `/?source=${source}&page=${back}&q=${encodeURIComponent(q)}&category=${encodeURIComponent(category)}&country=${encodeURIComponent(country)}&year=${encodeURIComponent(year)}`;
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-6">

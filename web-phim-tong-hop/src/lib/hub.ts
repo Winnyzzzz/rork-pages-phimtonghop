@@ -1,4 +1,4 @@
-/** Client for the documented NguonC and KKPhim APIs used by /phimtonghop. */
+/** Client for the documented NguonC and KKPhim APIs used by the home feed. */
 
 export type HubSource = "nguonc" | "kk";
 export type HubFeedSource = HubSource | "all";

@@ -40,7 +40,7 @@ Cloudflare Pages sẽ tự cài dependency bằng Bun, chạy `bun run build` v�
 - `web-phim-tong-hop/bun.lockb` — file marker để Pages nhận diện project dùng Bun (Pages không hiểu `bun.lock` dạng text).
 - `web-phim-tong-hop/bunfig.toml` — cấu hình bun.
 - `.nvmrc` (gốc repo và trong app) + `web-phim-tong-hop/.node-version` — ghim Node 22 cho hệ thống build.
-- `web-phim-tong-hop/public/_redirects` — fallback SPA để các link như `/phimtonghop/<slug>` mở trực tiếp không bị 404.
+- `web-phim-tong-hop/public/_redirects` — fallback SPA để các link như `/phim/<slug>` mở trực tiếp không bị 404.
 - `web-phim-tong-hop/public/_headers` — cache dài hạn cho asset, header bảo mật cơ bản.
 - (đã bỏ `wrangler.toml` — với project kết nối qua Git, Pages dùng cấu hình Build settings trên dashboard, tránh lỗi thiếu trường `name`)
 
