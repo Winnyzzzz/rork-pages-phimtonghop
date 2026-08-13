@@ -57,16 +57,7 @@ const ADTS_SAMPLE_RATES: Record<number, number> = {
   12: 7350,
 };
 
-/** Tìm header ADTS đầu tiên trong vùng dữ liệu và trả về tần số lấy mẫu. */
-function findAdtsSampleRate(data: Uint8Array): number | null {
-  for (let k = 0; k + 3 <= data.length; k += 1) {
-    if (data[k] === 0xff && (data[k + 1] & 0xf6) === 0xf0) {
-      const index = (data[k + 2] & 0x3c) >> 2;
-      return ADTS_SAMPLE_RATES[index] ?? null;
-    }
-  }
-  return null;
-}
+/** Tần số lấy mẫu theo index trong header ADTS (ISO/IEC 13818-7, bảng 35). */
 
 function toHex(bytes: number[]): string {
   let out = "";
@@ -95,6 +86,8 @@ export function probeTsSegment(data: Uint8Array): TsProbe | null {
   let videoPts: number | null = null;
   let spsHash: string | null = null;
   let audioSampleRate: number | null = null;
+  // Đã xem qua packet PUSI âm thanh đầu tiên (để biết lúc nào được dừng chờ ADTS).
+  let audioChecked = false;
   // Gom payload video để tìm SPS (có thể nằm ở packet sau PES đầu).
   const spsBuffer: number[] = [];
   let spsSearchedUpTo = 0;
@@ -160,19 +153,24 @@ export function probeTsSegment(data: Uint8Array): TsProbe | null {
     }
 
     if (videoPid === null || pid !== videoPid) {
-      // Audio: tìm ADTS để biết tần số lấy mẫu (ảnh hưởng độ liền mạch khi remux).
-      if (audioSampleRate === null && audioCodec === "aac" && audioPid !== null && pid === audioPid) {
-        const audioData = pusi
-          ? data[payload] === 0x00 && data[payload + 1] === 0x00 && data[payload + 2] === 0x01
-            ? data.subarray(
-                payload + 9 + data[payload + 8],
-                Math.min(data.length, payload + 9 + data[payload + 8] + 8192),
-              )
-            : null
-          : data.subarray(payload, Math.min(data.length, i + TS_PACKET));
-        if (audioData) {
-          const rate = findAdtsSampleRate(audioData);
-          if (rate !== null) audioSampleRate = rate;
+      // Audio: đọc tần số lấy mẫu từ header ADTS ở ĐẦU payload của packet PUSI
+      // đầu tiên. Chỉ tin đúng vị trí này — quét dò giữa dữ liệu nén dễ trúng mẫu
+      // giả (0xFF F1) và nhận nhầm tần số, làm hỏng việc phân nhóm profile.
+      if (
+        audioSampleRate === null &&
+        audioCodec === "aac" &&
+        audioPid !== null &&
+        pid === audioPid &&
+        pusi
+      ) {
+        if (data[payload] === 0x00 && data[payload + 1] === 0x00 && data[payload + 2] === 0x01) {
+          const adtsStart = payload + 9 + data[payload + 8];
+          if (adtsStart + 3 <= data.length) {
+            if (data[adtsStart] === 0xff && (data[adtsStart + 1] & 0xf6) === 0xf0) {
+              audioSampleRate = ADTS_SAMPLE_RATES[(data[adtsStart + 2] & 0x3c) >> 2] ?? null;
+            }
+          }
+          audioChecked = true;
         }
       }
       continue;
@@ -216,9 +214,9 @@ export function probeTsSegment(data: Uint8Array): TsProbe | null {
       }
     }
 
-    // Với luồng AAC, phải đợi thêm đến khi đọc được header ADTS (tần số lấy mẫu)
-    // mới dừng quét — audio thường nằm sau PES video đầu tiên.
-    if (videoPts !== null && spsDone && (audioSampleRate !== null || audioCodec !== "aac")) break;
+    // Với luồng AAC, phải đợi tới khi xem xong packet âm thanh đầu tiên mới dừng
+    // quét — audio thường nằm sau PES video đầu tiên.
+    if (videoPts !== null && spsDone && (audioChecked || audioSampleRate !== null || audioCodec !== "aac")) break;
   }
 
   if (videoPid === null || videoCodec === null) return null;

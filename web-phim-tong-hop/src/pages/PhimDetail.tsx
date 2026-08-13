@@ -408,12 +408,6 @@ export default function PhimDetail() {
             <p className="mt-2 text-xs text-muted-foreground">Đang bổ sung các nguồn còn lại…</p>
           )}
 
-          <MovieInfo
-            data={data}
-            onShare={() => void shareCurrentUrl()}
-            onTrailer={data.trailerUrl ? openTrailer : undefined}
-          />
-
           {currentServer && currentServer.episodes.length > 0 && (
             <section className="mt-8">
               <div className="mb-3 flex flex-wrap items-baseline gap-x-3 gap-y-1">
@@ -459,6 +453,12 @@ export default function PhimDetail() {
               </div>
             </section>
           )}
+
+          <MovieInfo
+            data={data}
+            onShare={() => void shareCurrentUrl()}
+            onTrailer={data.trailerUrl ? openTrailer : undefined}
+          />
 
           <RelatedMovies rows={relatedRows} loading={isLoadingRelated} />
 

@@ -162,6 +162,11 @@ export class TsRemuxer {
       out.push(this.init);
     }
     out.push(...this.chunks);
+    if (this.chunks.length === 0) {
+      // Đoạn không đủ mẫu để tạo mảnh (VD stub 0.04s ở cuối playlist) —
+      // giữ nguyên vị trí dự kiến để các đoạn sau khớp dòng thời gian.
+      return { chunks: out, placedAt: expectedStartSeconds };
+    }
     // Vị trí đầu ra: giữ PTS gốc khi liền mạch; khi đã chỉnh mốc thành công thì là
     // vị trí dự kiến, còn không chỉnh được thì giữ PTS gốc (để expectedStart bám
     // theo thực tế).

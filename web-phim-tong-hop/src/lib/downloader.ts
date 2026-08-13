@@ -8,12 +8,13 @@
 //  - Phát hiện phần mở đầu giống trailer/intro (đoạn ngắn tách bởi discontinuity)
 //    và bỏ qua khi ghép file — ghép lẫn codec/độ phân giải khiến trình phát dừng
 //    sau vài chục giây.
-//  - Dò codec (H.264/HEVC…), chữ ký SPS và PTS của từng phân đoạn TS để nhận ra
-//    các khối được mã hóa bởi các encoder khác nhau (trailer ghép trước tập phim,
-//    đoạn convertv8 thay thế…). Đoạn mở đầu khác luồng mã hóa bị bỏ qua; khi toàn
-//    bộ phần giữ lại là H.264 + AAC, file được đóng gói lại thành MP4 chuẩn với
-//    dòng thời gian liền mạch (remux qua mux.js) — khắc phục lỗi "tải về chỉ xem
-//    được vài chục giây" do ghép thô TS nhiều luồng khác nhau.
+//  - Dò codec (H.264/HEVC…), chữ ký SPS, tần số lấy mẫu và PTS của từng phân đoạn
+//    TS để nhận ra các khối được mã hóa bởi các encoder khác nhau (trailer ghép
+//    trước tập phim, đoạn convertv8 thay thế…). Khối mở đầu khác codec bị bỏ qua;
+//    khi toàn bộ phần giữ lại là H.264 + AAC (kể cả nhiều khối khác SPS — mux.js
+//    nhúng SPS/PPS mới in-band), file được đóng gói lại thành MP4 chuẩn với dòng
+//    thời gian liền mạch (remux qua mux.js) — khắc phục lỗi "tải về chỉ xem được
+//    vài chục giây" do ghép thô TS nhiều luồng khác nhau.
 //  - Kiểm tra dữ liệu từng phân đoạn (sync byte TS / box MP4) và thử lại tối đa 3
 //    lần — bắt lỗi máy chủ trả trang lỗi HTML thay vì video (file "đủ dung lượng
 //    nhưng chỉ xem được vài giây").
@@ -878,9 +879,34 @@ class DownloadManager {
       }
     }
 
+    // Kiểm tra một dãy phân đoạn có đóng gói lại thành MP4 được không:
+    // toàn bộ phải là H.264 + AAC (hoặc không audio) với cùng tần số lấy mẫu.
+    // Cho phép các khối khác SPS — playlist phim bộ của KK thường xen các đoạn
+    // "convertv8"/"v8" được mã hóa lại bằng encoder khác; mux.js nhúng SPS/PPS
+    // mới ngay trong dữ liệu mẫu (in-band) nên trình phát tự chuyển cấu hình,
+    // còn lớp remux chỉ cần dịch mốc thời gian khi PTS nhảy giữa các khối.
+    const isRemuxable = (probeList: (TsProbe | null)[]): boolean =>
+      probeList.length >= 2 &&
+      probeList.every((probe) => probe !== null) &&
+      probeList.every(
+        (probe) =>
+          (probe as TsProbe).videoCodec === "avc" &&
+          (probe as TsProbe).videoPts !== null &&
+          ((probe as TsProbe).audioCodec === "aac" || (probe as TsProbe).audioCodec === null),
+      ) &&
+      new Set(
+        probeList
+          .filter((probe) => probe !== null)
+          .map((probe) => (probe as TsProbe).audioSampleRate)
+          .filter((rate): rate is number => rate !== null),
+      ).size <= 1;
+
     let profileSkipCount = 0;
     let profileSkippedDuration = 0;
-    if (runs.length > 1) {
+    let canRemux = isRemuxable(probes);
+    // Nếu toàn bộ không đóng gói được (VD khối đầu khác codec) nhưng bỏ khối mở
+    // đầu ngắn thì phần còn lại đóng gói được → bỏ khối mở đầu (trailer/intro).
+    if (!canRemux && runs.length > 1) {
       let dominant = runs[0];
       for (const run of runs) if (run.duration > dominant.duration) dominant = run;
       const first = runs[0];
@@ -890,29 +916,18 @@ class DownloadManager {
         dominant.known &&
         dominant.duration > 0 &&
         first.duration <= 180 &&
-        dominant.duration >= first.duration * 3
+        dominant.duration >= first.duration * 3 &&
+        isRemuxable(probes.slice(first.endIndex))
       ) {
         profileSkipCount = first.endIndex;
         profileSkippedDuration = first.duration;
+        canRemux = true;
       }
     }
 
     const finalKept = kept.slice(profileSkipCount);
     const finalProbes = probes.slice(profileSkipCount);
     const finalDuration = keptDuration - profileSkippedDuration;
-
-    // Chỉ đóng gói lại MP4 khi toàn bộ phần giữ lại cùng một luồng H.264 + AAC
-    // (mux.js không hỗ trợ HEVC/MP3). Các trường hợp khác giữ nguyên cách ghép TS.
-    const canRemux =
-      finalKept.length >= 2 &&
-      finalProbes.every((probe) => probe !== null) &&
-      new Set(finalProbes.map((probe) => (probe as TsProbe).profileKey)).size === 1 &&
-      finalProbes.every(
-        (probe) =>
-          (probe as TsProbe).videoCodec === "avc" &&
-          (probe as TsProbe).videoPts !== null &&
-          ((probe as TsProbe).audioCodec === "aac" || (probe as TsProbe).audioCodec === null),
-      );
 
     // Đặt đuôi file theo định dạng thật của phần GIỮ LẠI: đóng gói MP4 hoặc fMP4
     // có init segment → .mp4; MPEG-TS → .ts (lưu TS dưới tên .mp4 khiến nhiều trình
@@ -935,8 +950,13 @@ class DownloadManager {
         `bỏ qua ${profileSkipCount} đoạn khác luồng mã hóa (${formatDuration(profileSkippedDuration)})`,
       );
     }
-    if (canRemux) summaryParts.push("đã đóng gói lại MP4 chuẩn — dòng thời gian liền mạch");
-    else if (runs.length > 1) {
+    if (canRemux) {
+      summaryParts.push(
+        runs.length > 1
+          ? "đã đóng gói lại MP4 — ghép liền mạch các khối mã hóa khác nhau"
+          : "đã đóng gói lại MP4 chuẩn — dòng thời gian liền mạch",
+      );
+    } else if (runs.length > 1) {
       summaryParts.push("trộn nhiều luồng mã hóa — giữ TS, mở bằng VLC nếu trình duyệt dừng giữa chừng");
     }
     if (parsed.discontinuities.length > 0) summaryParts.push(`${parsed.discontinuities.length} discontinuity`);
@@ -1006,11 +1026,8 @@ class DownloadManager {
         const probe = finalProbes[i] as TsProbe;
         const ptsSeconds = (probe.videoPts as number) / 90000;
         const result = await remuxer.push(data, ptsSeconds, expectedStart);
-        if (result.chunks.length === 0) {
-          throw new Error(
-            `Không thể đóng gói phân đoạn ${i + 1} (luồng không chuẩn) — hãy thử lại`,
-          );
-        }
+        // Đoạn cực ngắn (VD 0.04s ở cuối playlist) có thể không tạo mảnh nào —
+        // bỏ qua nhưng vẫn giữ dòng thời gian để các đoạn sau khớp vị trí.
         for (const chunk of result.chunks) {
           await append(chunk);
           task.loadedBytes += chunk.length;
