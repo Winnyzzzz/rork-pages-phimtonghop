@@ -883,23 +883,29 @@ class DownloadManager {
     // toàn bộ phải là H.264 + AAC (hoặc không audio) với cùng tần số lấy mẫu.
     // Cho phép các khối khác SPS — playlist phim bộ của KK thường xen các đoạn
     // "convertv8"/"v8" được mã hóa lại bằng encoder khác; mux.js nhúng SPS/PPS
-    // mới ngay trong dữ liệu mẫu (in-band) nên trình phát tự chuyển cấu hình,
-    // còn lớp remux chỉ cần dịch mốc thời gian khi PTS nhảy giữa các khối.
-    const isRemuxable = (probeList: (TsProbe | null)[]): boolean =>
-      probeList.length >= 2 &&
-      probeList.every((probe) => probe !== null) &&
-      probeList.every(
-        (probe) =>
-          (probe as TsProbe).videoCodec === "avc" &&
-          (probe as TsProbe).videoPts !== null &&
-          ((probe as TsProbe).audioCodec === "aac" || (probe as TsProbe).audioCodec === null),
-      ) &&
-      new Set(
-        probeList
-          .filter((probe) => probe !== null)
-          .map((probe) => (probe as TsProbe).audioSampleRate)
+    // mới ngay trong dữ liệu mẫu (in-band) nên trình phát tự chuyển cấu hình.
+    //
+    // Chỉ đoạn nào DÒ THẤY codec không tương thích (HEVC/MPEG-2/AC-3/MP3…) mới
+    // chặn đóng gói MP4. Đoạn dò lỗi (null — mạng chập chờn, đoạn cực ngắn không
+    // có PES video như stub 0.16s…) được coi là cùng luồng; nếu không, một đoạn
+    // lỗi duy nhất trong hàng trăm đoạn sẽ khiến cả file rơi về ghép thô TS.
+    const isRemuxable = (probeList: (TsProbe | null)[]): boolean => {
+      const known = probeList.filter((probe): probe is TsProbe => probe !== null);
+      const unknownCount = probeList.length - known.length;
+      if (known.length < 2) return false;
+      if (unknownCount > Math.max(2, Math.ceil(probeList.length * 0.1))) return false;
+      const rates = new Set(
+        known
+          .map((probe) => probe.audioSampleRate)
           .filter((rate): rate is number => rate !== null),
-      ).size <= 1;
+      );
+      if (rates.size > 1) return false;
+      return known.every(
+        (probe) =>
+          probe.videoCodec === "avc" &&
+          (probe.audioCodec === "aac" || probe.audioCodec === null),
+      );
+    };
 
     let profileSkipCount = 0;
     let profileSkippedDuration = 0;
@@ -927,6 +933,7 @@ class DownloadManager {
 
     const finalKept = kept.slice(profileSkipCount);
     const finalDuration = keptDuration - profileSkippedDuration;
+    const unknownProbeCount = probes.filter((probe) => probe === null).length;
 
     // Đặt đuôi file theo định dạng thật của phần GIỮ LẠI: đóng gói MP4 hoặc fMP4
     // có init segment → .mp4; MPEG-TS → .ts (lưu TS dưới tên .mp4 khiến nhiều trình
@@ -955,6 +962,9 @@ class DownloadManager {
           ? "đã đóng gói lại MP4 — ghép liền mạch các khối mã hóa khác nhau"
           : "đã đóng gói lại MP4 chuẩn — dòng thời gian liền mạch",
       );
+      if (unknownProbeCount > 0) {
+        summaryParts.push(`${unknownProbeCount} đoạn không dò được — giả định cùng luồng mã hóa`);
+      }
     } else if (runs.length > 1) {
       summaryParts.push("trộn nhiều luồng mã hóa — giữ TS, mở bằng VLC nếu trình duyệt dừng giữa chừng");
     }
@@ -990,7 +1000,7 @@ class DownloadManager {
 
     const keyCache = new Map<string, ArrayBuffer>();
     const mapCache = new Map<string, Uint8Array>();
-    const remuxer = canRemux ? new TsRemuxer() : null;
+    const remuxer = canRemux ? new TsRemuxer(finalDuration) : null;
 
     // Tải song song CONCURRENCY phân đoạn nhưng ghi vào file theo đúng thứ tự playlist.
     const slots: Promise<Uint8Array>[] = new Array<Promise<Uint8Array>>(finalKept.length);

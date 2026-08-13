@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { patchMfhdSequence, TsRemuxer } from "@/lib/ts-remux";
+import { patchMfhdSequence, patchTrackTfdt, TsRemuxer } from "@/lib/ts-remux";
 
 // ---------------------------------------------------------------------------
 // Công cụ dựng phân đoạn MPEG-TS tối giản (chỉ luồng AAC) để kiểm chứng
@@ -201,6 +201,64 @@ function readTfdt(chunk: Uint8Array): number {
   throw new Error("Không tìm thấy tfdt");
 }
 
+/** Tất cả box con trực tiếp của một box (start = đầu box, kể cả header). */
+function childrenOf(bytes: Uint8Array, parent: Box): Box[] {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const out: Box[] = [];
+  let cursor = parent.start + 8;
+  while (cursor + 8 <= parent.end) {
+    const size = view.getUint32(cursor, false);
+    let type = "";
+    for (let i = 0; i < 4; i += 1) type += String.fromCharCode(view.getUint8(cursor + 4 + i));
+    if (size < 8 || cursor + size > parent.end) break;
+    out.push({ type, start: cursor, end: cursor + size });
+    cursor += size;
+  }
+  return out;
+}
+
+/** Dựng box MP4 đơn giản (size + type + payload) để test độc lập với mux.js. */
+function makeBox(type: string, payload: Uint8Array): Uint8Array {
+  const out = new Uint8Array(8 + payload.length);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, out.length, false);
+  for (let i = 0; i < 4; i += 1) out[4 + i] = type.charCodeAt(i);
+  out.set(payload, 8);
+  return out;
+}
+
+function tfhdPayload(trackId: number): Uint8Array {
+  const payload = new Uint8Array(8); // version + flags + track_ID
+  new DataView(payload.buffer).setUint32(4, trackId, false);
+  return payload;
+}
+
+function tfdtPayloadV1(value: number): Uint8Array {
+  const payload = new Uint8Array(12); // version 1 + flags + 64-bit
+  payload[0] = 1;
+  const view = new DataView(payload.buffer);
+  view.setUint32(4, Math.floor(value / 0x100000000), false);
+  view.setUint32(8, value >>> 0, false);
+  return payload;
+}
+
+function makeTraf(trackId: number, tfdtValue: number): Uint8Array {
+  return makeBox("traf", concat([makeBox("tfhd", tfhdPayload(trackId)), makeBox("tfdt", tfdtPayloadV1(tfdtValue))]));
+}
+
+/** Đọc tfdt của traf thứ `trafIndex` trong moof (đếm từ 0). */
+function readTfdtOfTraf(bytes: Uint8Array, trafIndex: number): number {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const moof = topBoxes(bytes).find((box) => box.type === "moof");
+  if (!moof) throw new Error("Không tìm thấy moof");
+  const trafs = childrenOf(bytes, moof).filter((box) => box.type === "traf");
+  const tfdt = findChild(bytes, trafs[trafIndex], "tfdt");
+  if (!tfdt) throw new Error("Không tìm thấy tfdt");
+  const high = view.getUint32(tfdt.start + 12, false);
+  const low = view.getUint32(tfdt.start + 16, false);
+  return high * 0x100000000 + low;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -276,5 +334,60 @@ describe("TsRemuxer", () => {
     const result = await remuxer.push(empty, 3);
     expect(result.chunks.length).toBe(0);
     expect(result.placedAt).toBe(3);
+  });
+
+  it("vá thời lượng thật vào moov (mvhd/tkhd/mdhd) thay vì 0xFFFFFFFF", async () => {
+    const remuxer = new TsRemuxer(10);
+    const result = await remuxer.push(makeAacSegment(0), 0);
+    const init = result.chunks[0];
+    const view = new DataView(init.buffer, init.byteOffset, init.byteLength);
+    const moov = topBoxes(init).find((box) => box.type === "moov");
+    expect(moov).toBeDefined();
+    let sawMvhd = false;
+    let sawTkhd = false;
+    let sawMdhd = false;
+    for (const child of childrenOf(init, moov as Box)) {
+      if (child.type === "mvhd") {
+        sawMvhd = true;
+        expect(view.getUint32(child.start + 20, false)).toBe(90000); // timescale
+        expect(view.getUint32(child.start + 24, false)).toBe(900000); // 10s × 90 kHz
+      } else if (child.type === "trak") {
+        for (const sub of childrenOf(init, child)) {
+          if (sub.type === "tkhd") {
+            sawTkhd = true;
+            expect(view.getUint32(sub.start + 28, false)).toBe(900000); // theo timescale movie
+          } else if (sub.type === "mdia") {
+            for (const inner of childrenOf(init, sub)) {
+              if (inner.type === "mdhd") {
+                sawMdhd = true;
+                expect(view.getUint32(inner.start + 20, false)).toBe(48000); // timescale audio
+                expect(view.getUint32(inner.start + 24, false)).toBe(480000); // 10s × 48 kHz
+              }
+            }
+          }
+        }
+      }
+    }
+    expect(sawMvhd && sawTkhd && sawMdhd).toBe(true);
+  });
+
+  it("ép tfdt của từng track về đúng vị trí theo timescale riêng (video 90 kHz, audio 48 kHz)", () => {
+    const moof = makeBox("moof", concat([makeTraf(1, 12345), makeTraf(2, 67890)]));
+    patchTrackTfdt(
+      moof,
+      new Map([
+        [1, { timescale: 90000 }],
+        [2, { timescale: 48000 }],
+      ]),
+      7.5,
+    );
+    expect(readTfdtOfTraf(moof, 0)).toBe(675000);
+    expect(readTfdtOfTraf(moof, 1)).toBe(360000);
+  });
+
+  it("bỏ qua traf không rõ track khi ép tfdt", () => {
+    const moof = makeBox("moof", concat([makeTraf(99, 111)]));
+    patchTrackTfdt(moof, new Map([[1, { timescale: 90000 }]]), 4);
+    expect(readTfdtOfTraf(moof, 0)).toBe(111);
   });
 });
