@@ -8,7 +8,6 @@ import { blvListPageKey, getBlvListPage, unaccent, type BlvListItem } from "@/li
 import { readListPosition, saveListPosition } from "@/lib/watch-memory";
 
 const LIST_SCOPE = "blv-list";
-const BLV_HOME_URL = "https://www.blvietsub.vip/";
 
 /** Danh sách phim Boylove — nguồn BLVietsub.vip, độc lập với NC/KK. */
 export default function BlvList() {
@@ -59,14 +58,6 @@ export default function BlvList() {
           <Logo size={40} />
           <div>
             <h1 className="text-2xl font-bold">Boy Love</h1>
-            <a
-              href={BLV_HOME_URL}
-              target="_blank"
-              rel="noreferrer"
-              className="text-xs text-muted-foreground hover:underline"
-            >
-              Nguồn: BLVietsub.vip — phim Boylove vietsub
-            </a>
           </div>
         </div>
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 sm:flex-none">
