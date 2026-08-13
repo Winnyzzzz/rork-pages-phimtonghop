@@ -141,9 +141,7 @@ async function decryptAes128(data: ArrayBuffer, keyBytes: ArrayBuffer, iv: Uint8
   return crypto.subtle.decrypt({ name: "AES-CBC", iv: iv as unknown as BufferSource }, key, data);
 }
 
-function triggerBrowserSave(fileName: string, chunks: BlobPart[]): void {
-  const mime = fileName.toLowerCase().endsWith(".ts") ? "video/mp2t" : "video/mp4";
-  const blob = new Blob(chunks, { type: mime });
+function triggerBrowserSave(fileName: string, blob: Blob): void {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
@@ -151,15 +149,61 @@ function triggerBrowserSave(fileName: string, chunks: BlobPart[]): void {
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  // Giữ object URL đủ lâu để trình duyệt sao chép xong file lớn (OPFS → Downloads).
+  setTimeout(() => URL.revokeObjectURL(url), 600_000);
 }
 
-type SaveFilePickerWindow = Window & {
-  showSaveFilePicker?: (options?: {
-    suggestedName?: string;
-    types?: { description?: string; accept: Record<string, string[]> }[];
-  }) => Promise<{ createWritable: () => Promise<FileSystemWritableFileStream> }>;
+// Nơi chứa dữ liệu trong lúc tải: OPFS (đĩa ảo của origin, không tốn RAM)
+// hoặc bộ nhớ nếu trình duyệt không hỗ trợ OPFS.
+type BufferSink = {
+  append: (bytes: Uint8Array) => Promise<void>;
+  finish: () => Promise<Blob>;
+  abort: () => Promise<void>;
 };
+
+async function createOpfsSink(): Promise<BufferSink | null> {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const dir = await root.getDirectoryHandle("video-downloads", { create: true });
+    // Dọn các file tạm quá 1 giờ (đã được trình duyệt sao chép xong từ lần trước).
+    for await (const [name] of dir.entries()) {
+      const match = /^v-(\d+)-/.exec(name);
+      if (match && Date.now() - Number(match[1]) > 3_600_000) {
+        await dir.removeEntry(name).catch(() => undefined);
+      }
+    }
+    const name = `v-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const handle = await dir.getFileHandle(name, { create: true });
+    const writer = await handle.createWritable();
+    return {
+      append: async (bytes: Uint8Array) => {
+        await writer.write(bytes.buffer as ArrayBuffer);
+      },
+      finish: async () => {
+        await writer.close();
+        // File nằm trên đĩa; tạo Blob từ nó để trình duyệt stream vào Downloads.
+        return handle.getFile();
+      },
+      abort: async () => {
+        await writer.abort().catch(() => undefined);
+        await dir.removeEntry(name).catch(() => undefined);
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+function createMemorySink(mime: string): BufferSink {
+  const chunks: BlobPart[] = [];
+  return {
+    append: async (bytes: Uint8Array) => {
+      chunks.push(bytes.buffer as ArrayBuffer);
+    },
+    finish: async () => new Blob(chunks, { type: mime }),
+    abort: async () => undefined,
+  };
+}
 
 class DownloadManager {
   private tasks: TaskInternal[] = [];
@@ -280,50 +324,22 @@ class DownloadManager {
   }
 
   private async run(task: TaskInternal): Promise<void> {
-    let writable: FileSystemWritableFileStream | null = null;
+    let sink: BufferSink | null = null;
     try {
-      // Hộp thoại chọn nơi lưu phải gọi ngay trong thao tác người dùng (gesture).
-      const pickerWindow = window as SaveFilePickerWindow;
-      if (typeof pickerWindow.showSaveFilePicker === "function") {
-        try {
-          const picker = pickerWindow.showSaveFilePicker({
-            suggestedName: task.fileName,
-            types: [
-              {
-                description: "Video",
-                accept: { "video/*": [".mp4", ".ts", ".mkv", ".webm"] },
-              },
-            ],
-          });
-          const handle = await picker;
-          writable = await handle.createWritable();
-        } catch {
-          if (!task.abort.signal.aborted) {
-            task.status = "cancelled";
-            task.message = "Đã hủy";
-          }
-          return;
-        }
-      }
+      // Tải trước vào đĩa ảo OPFS (không hỏi thư mục, không tốn RAM);
+      // trình duyệt không hỗ trợ thì dồn vào bộ nhớ.
+      const mime = task.fileName.toLowerCase().endsWith(".ts") ? "video/mp2t" : "video/mp4";
+      sink = (await createOpfsSink()) ?? createMemorySink(mime);
+      await this.downloadInto(task, (bytes) => sink!.append(bytes));
 
-      const memoryChunks: BlobPart[] = [];
-      const append = async (bytes: Uint8Array): Promise<void> => {
-        const buffer = bytes.buffer as ArrayBuffer;
-        if (writable) await writable.write(buffer);
-        else memoryChunks.push(buffer);
-      };
-
-      await this.downloadInto(task, append);
-
+      const blob = await sink.finish();
       task.status = "done";
-      task.message = "Đã lưu về máy";
+      task.message = "Đã đưa vào mục Tải xuống";
       task.speedBps = 0;
       this.emit();
-      if (writable) {
-        await writable.close();
-      } else {
-        triggerBrowserSave(task.fileName, memoryChunks);
-      }
+      // Lệnh tải ảo: dữ liệu đã nằm sẵn trên máy nên trình duyệt chỉ cần
+      // sao chép vào thư mục Downloads — file 100MB hoàn tất gần như ngay lập tức.
+      triggerBrowserSave(task.fileName, blob);
     } catch (error) {
       if (task.abort.signal.aborted) {
         task.status = "cancelled";
@@ -332,7 +348,7 @@ class DownloadManager {
         task.status = "error";
         task.message = error instanceof Error ? error.message : "Lỗi không xác định";
       }
-      if (writable) await writable.abort?.().catch(() => undefined);
+      await sink?.abort();
       this.emit();
     }
   }

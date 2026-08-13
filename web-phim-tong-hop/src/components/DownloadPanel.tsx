@@ -52,7 +52,7 @@ function TaskRow({ task }: { task: DownloadTask }) {
       </div>
 
       <div className="mt-1 flex items-center gap-2 text-[11px]">
-        {task.status === "done" && <span className="font-medium text-emerald-600">Hoàn tất — đã lưu về máy</span>}
+        {task.status === "done" && <span className="font-medium text-emerald-600">Hoàn tất — đã đưa vào mục Tải xuống</span>}
         {task.status === "error" && <span className="text-red-600">Lỗi: {task.message}</span>}
         {task.status === "cancelled" && <span className="text-muted-foreground">Đã hủy</span>}
         {active && <span className="text-muted-foreground">{task.message}</span>}
