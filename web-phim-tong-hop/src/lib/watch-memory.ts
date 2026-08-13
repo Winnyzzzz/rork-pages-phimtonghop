@@ -7,6 +7,8 @@ export type WatchEntry = {
   server: number;
   ep: number;
   from?: string;
+  /** Nguồn phát đang chọn (dùng cho trang phim BL). */
+  src?: number;
   updatedAt: number;
 };
 

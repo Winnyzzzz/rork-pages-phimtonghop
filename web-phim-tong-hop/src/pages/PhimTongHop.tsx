@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { MapPin, SlidersHorizontal, Tags, X } from "lucide-react";
+import { Heart, MapPin, SlidersHorizontal, Tags, X } from "lucide-react";
 
 import {
   getHubFilters,
@@ -236,6 +236,13 @@ export default function PhimTongHop() {
             {tab.label}
           </button>
         ))}
+        <Link
+          to="/blv"
+          className="inline-flex items-center gap-1.5 rounded-full border border-rose-200 bg-rose-50 px-4 py-1.5 text-sm font-medium text-rose-600 transition hover:bg-rose-100"
+        >
+          <Heart size={14} aria-hidden="true" />
+          Phim BL
+        </Link>
         {!q && (
           <button
             type="button"

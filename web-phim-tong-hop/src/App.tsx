@@ -6,6 +6,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 
 import PhimTongHop from "./pages/PhimTongHop";
 import PhimDetail from "./pages/PhimDetail";
+import BlvList from "./pages/BlvList";
+import BlvDetail from "./pages/BlvDetail";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -26,6 +28,8 @@ const App = () => (
           <Route path="/phim/:slug" element={<PhimDetail />} />
           <Route path="/phimtonghop" element={<Navigate to="/" replace />} />
           <Route path="/phimtonghop/:slug" element={<LegacyDetailRedirect />} />
+          <Route path="/blv" element={<BlvList />} />
+          <Route path="/blv/:slug" element={<BlvDetail />} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       </BrowserRouter>
