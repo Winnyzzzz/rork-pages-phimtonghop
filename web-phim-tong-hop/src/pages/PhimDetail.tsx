@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
+import { Share2 } from "lucide-react";
 
 import { HlsPlayer } from "@/components/HlsPlayer";
+import { toast } from "@/components/ui/sonner";
 import {
   getHubDetailAlternates,
   getHubDetailPrimary,
@@ -25,6 +27,39 @@ function toSource(v: string | null, fallback: HubSource = "nguonc"): HubSource {
 function toInt(v: string | null, min: number, fallback: number): number {
   const n = Number(v);
   return Number.isFinite(n) ? Math.max(min, Math.trunc(n)) : fallback;
+}
+
+/** Sao chép URL hiện tại vào khay nhớ tạm, kèm fallback cho trình duyệt cũ/ngữ cảnh không bảo mật. */
+async function copyCurrentUrl(): Promise<boolean> {
+  const url = window.location.href;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(url);
+      return true;
+    }
+  } catch {
+    // rơi xuống fallback phía dưới
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = url;
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch {
+    copied = false;
+  }
+  textarea.remove();
+  return copied;
+}
+
+async function shareCurrentUrl(): Promise<void> {
+  const ok = await copyCurrentUrl();
+  if (ok) toast.success("Đã sao chép đường dẫn");
+  else toast.error("Không thể sao chép đường dẫn");
 }
 
 export default function PhimDetail() {
@@ -163,7 +198,7 @@ export default function PhimDetail() {
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-6">
-      <div className="mb-3">
+      <div className="mb-3 flex items-center justify-between gap-2">
         <Link
           to={backHref}
           onClick={(e) => {
@@ -174,6 +209,14 @@ export default function PhimDetail() {
         >
           ← Về danh sách
         </Link>
+        <button
+          type="button"
+          onClick={() => void shareCurrentUrl()}
+          className="inline-flex min-h-10 items-center gap-1.5 rounded-md border bg-background px-3 text-sm font-medium transition hover:bg-muted"
+        >
+          <Share2 size={14} aria-hidden="true" />
+          Chia sẻ
+        </button>
       </div>
 
       {isLoading && <p className="text-muted-foreground">Đang tải nguồn đã chọn…</p>}
