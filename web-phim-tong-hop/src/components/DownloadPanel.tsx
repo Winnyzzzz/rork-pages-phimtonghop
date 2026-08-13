@@ -158,24 +158,6 @@ function TaskRow({ task }: { task: DownloadTask }) {
         <div className="mt-1 text-[11px] leading-snug text-muted-foreground">{task.playlistSummary}</div>
       )}
 
-      {task.hasPlaylist && (
-        <button
-          type="button"
-          onClick={() => {
-            const text = downloadManager.getPlaylistText(task.id);
-            if (!text) {
-              toast.error("Không có playlist để sao chép");
-              return;
-            }
-            void copyText(text, "Đã sao chép playlist — dán vào chat để chẩn đoán");
-          }}
-          className="mt-1 inline-flex min-h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium text-sky-600 transition hover:bg-muted"
-        >
-          <ClipboardCopy size={12} aria-hidden="true" />
-          Sao chép playlist (chẩn đoán)
-        </button>
-      )}
-
       {active && (
         <>
           <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-muted">

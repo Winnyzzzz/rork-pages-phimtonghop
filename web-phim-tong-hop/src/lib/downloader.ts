@@ -45,7 +45,6 @@ export type DownloadTask = {
   speedBps: number;
   message: string;
   playlistSummary?: string;
-  hasPlaylist: boolean;
   /** Cần người dùng bấm nút mới lưu file (trình duyệt WebView không tự lưu được). */
   savePending: boolean;
   /** Via/WebView: đường lưu không dùng blob (HTTPS trực tiếp / trình tải ngoài). */
@@ -57,7 +56,6 @@ type TaskInternal = DownloadTask & {
   lastTick: number;
   lastBytes: number;
   expectedSeconds?: number;
-  playlistTexts: string[];
   finished: FinishedBuffer | null;
   webViewSave?: WebViewSave;
 };
@@ -516,10 +514,6 @@ class DownloadManager {
 
   getSnapshot = (): DownloadTask[] => this.snapshot;
 
-  /** Lấy toàn bộ nội dung playlist đã tải (dùng để chẩn đoán/báo lỗi). */
-  getPlaylistText = (id: string): string | null =>
-    this.tasks.find((t) => t.id === id)?.playlistTexts.join("\n\n") ?? null;
-
   private emit(): void {
     this.snapshot = this.tasks.map((t) => ({
       id: t.id,
@@ -533,7 +527,6 @@ class DownloadManager {
       speedBps: t.speedBps,
       message: t.message,
       playlistSummary: t.playlistSummary,
-      hasPlaylist: t.playlistTexts.length > 0,
       savePending: t.savePending,
       webViewSave: t.webViewSave,
     }));
@@ -559,12 +552,10 @@ class DownloadManager {
       speedBps: 0,
       message: "Chờ tải…",
       playlistSummary: undefined,
-      hasPlaylist: false,
       abort: new AbortController(),
       lastTick: 0,
       lastBytes: 0,
       expectedSeconds,
-      playlistTexts: [],
       finished: null,
       savePending: false,
     };
@@ -942,11 +933,6 @@ class DownloadManager {
     playlist: string,
     append: (bytes: Uint8Array) => Promise<void>,
   ): Promise<void> {
-    // Lưu lại nội dung playlist để người dùng có thể sao chép và báo lỗi (chẩn đoán).
-    task.playlistTexts.push(
-      `=== ${task.playlistTexts.length === 0 ? "Playlist tải về" : "Playlist con"} (${baseUrl}) ===\n${playlist}`,
-    );
-
     if (playlist.includes("#EXT-X-STREAM-INF")) {
       const variantUrl = pickBestVariant(playlist, baseUrl);
       const { res: variant, finalUrl: variantFinal } = await this.fetchProxied(variantUrl, task);
