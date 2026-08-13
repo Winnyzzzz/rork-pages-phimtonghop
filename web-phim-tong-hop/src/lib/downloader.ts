@@ -926,7 +926,6 @@ class DownloadManager {
     }
 
     const finalKept = kept.slice(profileSkipCount);
-    const finalProbes = probes.slice(profileSkipCount);
     const finalDuration = keptDuration - profileSkippedDuration;
 
     // Đặt đuôi file theo định dạng thật của phần GIỮ LẠI: đóng gói MP4 hoặc fMP4
@@ -1023,10 +1022,7 @@ class DownloadManager {
       }
 
       if (remuxer) {
-        const probe = finalProbes[i] as TsProbe;
-        const ptsSeconds = (probe.videoPts as number) / 90000;
-        const audioPtsSeconds = probe.audioPts !== null ? probe.audioPts / 90000 : null;
-        const result = await remuxer.push(data, ptsSeconds, audioPtsSeconds, expectedStart);
+        const result = await remuxer.push(data, expectedStart);
         // Đoạn cực ngắn (VD 0.04s ở cuối playlist) có thể không tạo mảnh nào —
         // bỏ qua nhưng vẫn giữ dòng thời gian để các đoạn sau khớp vị trí.
         for (const chunk of result.chunks) {
