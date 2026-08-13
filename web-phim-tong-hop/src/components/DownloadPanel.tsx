@@ -1,8 +1,13 @@
 import { useSyncExternalStore } from "react";
-import { ClipboardCopy, Download, X } from "lucide-react";
+import { ClipboardCopy, Download, ExternalLink, X } from "lucide-react";
 
 import { toast } from "@/components/ui/sonner";
-import { downloadManager, type DownloadTask } from "@/lib/downloader";
+import {
+  buildDownloaderIntent,
+  downloadManager,
+  type DownloadTask,
+  type WebViewSave,
+} from "@/lib/downloader";
 
 function formatBytes(value: number): string {
   if (value < 1024) return `${value} B`;
@@ -18,12 +23,7 @@ function formatSpeed(bps: number): string {
 }
 
 /** Sao chép nội dung playlist của tác vụ để dán vào chat chẩn đoán. */
-async function copyPlaylist(id: string): Promise<void> {
-  const text = downloadManager.getPlaylistText(id);
-  if (!text) {
-    toast.error("Không có playlist để sao chép");
-    return;
-  }
+async function copyText(text: string, successMessage: string): Promise<boolean> {
   let copied = false;
   try {
     if (navigator.clipboard?.writeText) {
@@ -47,8 +47,63 @@ async function copyPlaylist(id: string): Promise<void> {
     }
     textarea.remove();
   }
-  if (copied) toast.success("Đã sao chép playlist — dán vào chat để chẩn đoán");
-  else toast.error("Không thể sao chép playlist");
+  if (copied) toast.success(successMessage);
+  return copied;
+}
+
+/**
+ * Nút lưu cho Via/WebView (blob: URL làm crash DownloadManager của WebView):
+ * file trực tiếp → tải thẳng HTTPS qua trình duyệt; HLS → giao link phát cho
+ * ADM/1DM (tải m3u8 kể cả AES-128 và tự ghép) hoặc sao chép link phát.
+ */
+function WebViewSaveButtons({ task }: { task: DownloadTask & { webViewSave: WebViewSave } }) {
+  const save = task.webViewSave;
+  const copyLink = (): void => {
+    void copyText(save.url, "Đã sao chép link phát — dán vào ADM/1DM để tải");
+  };
+  return (
+    <div className="mt-2 flex flex-col gap-1.5">
+      {save.kind === "direct" && (
+        <a
+          href={save.url}
+          download={task.fileName}
+          className="inline-flex min-h-9 w-full items-center justify-center gap-1.5 rounded-md bg-sky-600 px-3 text-xs font-semibold text-white transition hover:bg-sky-500"
+        >
+          <Download size={13} aria-hidden="true" />
+          Tải bằng trình duyệt
+        </a>
+      )}
+      <div className="grid grid-cols-2 gap-1.5">
+        <a
+          href={buildDownloaderIntent(save.url, "adm")}
+          className="inline-flex min-h-9 items-center justify-center gap-1 rounded-md border px-2 text-xs font-semibold transition hover:bg-muted"
+        >
+          <ExternalLink size={12} aria-hidden="true" />
+          Tải bằng ADM
+        </a>
+        <a
+          href={buildDownloaderIntent(save.url, "idm")}
+          className="inline-flex min-h-9 items-center justify-center gap-1 rounded-md border px-2 text-xs font-semibold transition hover:bg-muted"
+        >
+          <ExternalLink size={12} aria-hidden="true" />
+          Tải bằng 1DM
+        </a>
+      </div>
+      <button
+        type="button"
+        onClick={copyLink}
+        className="inline-flex min-h-8 items-center justify-center gap-1 rounded-md px-2 text-[11px] font-medium text-sky-600 transition hover:bg-muted"
+      >
+        <ClipboardCopy size={12} aria-hidden="true" />
+        Sao chép link phát
+      </button>
+      <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+        {save.kind === "hls"
+          ? "Trình duyệt này không tự lưu được video đã ghép — ADM/1DM sẽ tải link phát và tự ghép file."
+          : "Nếu trình duyệt chưa nhận lệnh tải, bấm lại nút bên trên hoặc dùng ADM."}
+      </p>
+    </div>
+  );
 }
 
 export default function DownloadPanel() {
@@ -89,7 +144,7 @@ function TaskRow({ task }: { task: DownloadTask }) {
       <div className="mt-1 flex items-center gap-2 text-[11px]">
         {task.status === "done" && (
           <span className="font-medium text-emerald-600">
-            {task.savePending ? task.message : "Hoàn tất — đã đưa vào mục Tải xuống"}
+            {task.savePending || task.webViewSave ? task.message : "Hoàn tất — đã đưa vào mục Tải xuống"}
           </span>
         )}
         {task.status === "error" && <span className="text-red-600">Lỗi: {task.message}</span>}
@@ -97,21 +152,7 @@ function TaskRow({ task }: { task: DownloadTask }) {
         {active && <span className="text-muted-foreground">{task.message}</span>}
       </div>
 
-      {task.status === "done" && task.savePending && (
-        <div className="mt-2">
-          <button
-            type="button"
-            onClick={() => void downloadManager.saveDone(task.id)}
-            className="inline-flex min-h-9 w-full items-center justify-center gap-1.5 rounded-md bg-sky-600 px-3 text-xs font-semibold text-white transition hover:bg-sky-500"
-          >
-            <Download size={13} aria-hidden="true" />
-            Lưu về máy
-          </button>
-          <p className="mt-1 text-[11px] leading-snug text-muted-foreground">
-            Trình duyệt của bạn không tự lưu được — chọn Files hoặc Drive trong hộp thoại để lưu file.
-          </p>
-        </div>
-      )}
+      {task.status === "done" && task.webViewSave && <WebViewSaveButtons task={{ ...task, webViewSave: task.webViewSave }} />}
 
       {task.playlistSummary && (
         <div className="mt-1 text-[11px] leading-snug text-muted-foreground">{task.playlistSummary}</div>
@@ -120,7 +161,14 @@ function TaskRow({ task }: { task: DownloadTask }) {
       {task.hasPlaylist && (
         <button
           type="button"
-          onClick={() => void copyPlaylist(task.id)}
+          onClick={() => {
+            const text = downloadManager.getPlaylistText(task.id);
+            if (!text) {
+              toast.error("Không có playlist để sao chép");
+              return;
+            }
+            void copyText(text, "Đã sao chép playlist — dán vào chat để chẩn đoán");
+          }}
           className="mt-1 inline-flex min-h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium text-sky-600 transition hover:bg-muted"
         >
           <ClipboardCopy size={12} aria-hidden="true" />

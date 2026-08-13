@@ -28,6 +28,11 @@ import { TsRemuxer } from "./ts-remux";
 
 export type DownloadStatus = "queued" | "active" | "done" | "error" | "cancelled";
 
+/** Cách lưu file trên Via/WebView — không dùng blob URL (WebView crash với blob:). */
+export type WebViewSave =
+  | { kind: "direct"; url: string }
+  | { kind: "hls"; url: string };
+
 export type DownloadTask = {
   id: string;
   fileName: string;
@@ -43,6 +48,8 @@ export type DownloadTask = {
   hasPlaylist: boolean;
   /** Cần người dùng bấm nút mới lưu file (trình duyệt WebView không tự lưu được). */
   savePending: boolean;
+  /** Via/WebView: đường lưu không dùng blob (HTTPS trực tiếp / trình tải ngoài). */
+  webViewSave?: WebViewSave;
 };
 
 type TaskInternal = DownloadTask & {
@@ -52,6 +59,7 @@ type TaskInternal = DownloadTask & {
   expectedSeconds?: number;
   playlistTexts: string[];
   finished: FinishedBuffer | null;
+  webViewSave?: WebViewSave;
 };
 
 type KeyRef = { uri?: string; ivHex?: string };
@@ -328,6 +336,21 @@ function triggerBrowserSaveUrl(fileName: string, href: string): void {
   anchor.remove();
 }
 
+/**
+ * Link intent:// mở trình tải ngoài (ADM/1DM) kèm link cần tải. ADM/1DM tải
+ * m3u8 trực tiếp (kể cả AES-128) và tự ghép phân đoạn — đường đáng tin nhất
+ * trên Via/WebView, nơi blob: URL làm crash DownloadManager.
+ */
+export function buildDownloaderIntent(targetUrl: string, app: "adm" | "idm"): string {
+  const pkg = app === "adm" ? "com.dv.adm" : "idm.internet.download.manager";
+  const fallback =
+    app === "adm"
+      ? "https://play.google.com/store/apps/details?id=com.dv.adm"
+      : "https://play.google.com/store/apps/details?id=idm.internet.download.manager";
+  const data = targetUrl.replace(/^https?:\/\//, "");
+  return `intent://${data}#Intent;scheme=https;package=${pkg};S.browser_fallback_url=${encodeURIComponent(fallback)};end`;
+}
+
 // ---------------------------------------------------------------------------
 // Service worker /sw-download: stream file đã tải xong từ OPFS kèm
 // Content-Length. Chromium treo (hiện 0.0B) khi tải blob tạo trực tiếp từ
@@ -512,6 +535,7 @@ class DownloadManager {
       playlistSummary: t.playlistSummary,
       hasPlaylist: t.playlistTexts.length > 0,
       savePending: t.savePending,
+      webViewSave: t.webViewSave,
     }));
     this.listeners.forEach((listener) => listener());
   }
@@ -641,6 +665,10 @@ class DownloadManager {
   }
 
   private async run(task: TaskInternal): Promise<void> {
+    if (isWebViewLike()) {
+      await this.runWebViewFlow(task);
+      return;
+    }
     let sink: BufferSink | null = null;
     try {
       sink = (await createOpfsSink()) ?? createMemorySink();
@@ -651,14 +679,6 @@ class DownloadManager {
       task.finished = finished;
       task.status = "done";
       task.speedBps = 0;
-      if (isWebViewLike()) {
-        // Via/WebView: không tự bấm blob URL (DownloadManager của WebView chỉ
-        // nhận HTTP(S) và crash với blob:) — chờ người dùng bấm nút lưu.
-        task.savePending = true;
-        task.message = "Đã tải xong — bấm nút \"Lưu về máy\" bên dưới";
-        this.emit();
-        return;
-      }
       task.message = "Đã đưa vào mục Tải xuống";
       this.emit();
       await this.triggerSave(task);
@@ -675,27 +695,7 @@ class DownloadManager {
     }
   }
 
-  /**
-   * Người dùng bấm "Lưu về máy" (đường bắt buộc trên Via/WebView: blob URL
-   * cần user gesture; tải tự động gây crash).
-   */
-  async saveDone(id: string): Promise<void> {
-    const task = this.tasks.find((t) => t.id === id);
-    if (!task || task.status !== "done" || !task.finished) return;
-    try {
-      await this.triggerSave(task);
-      task.message = isWebViewLike()
-        ? "Đã mở hộp thoại lưu — chọn nơi lưu rồi bấm Lưu"
-        : "Đã đưa vào mục Tải xuống";
-      this.emit();
-      setTimeout(() => this.clear(id), 15_000);
-    } catch (error) {
-      task.message = error instanceof Error ? error.message : "Không lưu được file";
-      this.emit();
-    }
-  }
-
-  /** Kích hoạt lưu file đã tải xong: SW stream → Web Share (WebView) → blob URL. */
+  /** Kích hoạt lưu file đã tải xong (browser thường): SW stream → blob URL. */
   private async triggerSave(task: TaskInternal): Promise<void> {
     const finished = task.finished;
     if (!finished) return;
@@ -710,26 +710,7 @@ class DownloadManager {
       return;
     }
 
-    // 2) Web Share (Android): mở share sheet để lưu vào Files/Drive — Android
-    //    WebView crash với blob: URL (DownloadManager chỉ nhận HTTP(S)).
-    if (
-      isWebViewLike() &&
-      typeof navigator.share === "function" &&
-      typeof navigator.canShare === "function" &&
-      navigator.canShare({ files: [finished.blob] })
-    ) {
-      try {
-        await navigator.share({ files: [finished.blob], title: task.fileName });
-        task.finished = null;
-        task.savePending = false;
-        return;
-      } catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") return;
-        // lỗi khác → thử blob URL bên dưới
-      }
-    }
-
-    // 3) Blob URL: chỉ copy qua arrayBuffer khi file nhỏ (file lớn copy vào RAM
+    // 2) Blob URL: chỉ copy qua arrayBuffer khi file nhỏ (file lớn copy vào RAM
     //    gây OOM trên mobile); file lớn dùng thẳng File làm blob.
     if (finished.size <= SAFE_COPY_LIMIT) {
       const buffer = await finished.blob.arrayBuffer();
@@ -739,6 +720,111 @@ class DownloadManager {
     }
     task.finished = null;
     task.savePending = false;
+  }
+
+  // -------------------------------------------------------------------------
+  // WebView (Via…): không dùng blob URL — DownloadManager của WebView chỉ nhận
+  // HTTP(S) và crash với blob:. Thay vì ghép video trong trang, phân giải nguồn
+  // rồi giao cho trình tải của trình duyệt (file trực tiếp) hoặc ADM/1DM (HLS).
+  // -------------------------------------------------------------------------
+
+  private async runWebViewFlow(task: TaskInternal): Promise<void> {
+    try {
+      task.status = "active";
+      task.message = "Đang kiểm tra nguồn video…";
+      this.emit();
+      const save = await this.resolveSourceForWebView(task, task.sourceUrl, 0);
+      task.webViewSave = save;
+      task.status = "done";
+      task.speedBps = 0;
+      task.savePending = true; // giữ panel để người dùng chọn cách tải
+      if (save.kind === "direct") {
+        triggerBrowserSaveUrl(task.fileName, save.url);
+        task.message = "Đã gửi lệnh tải tới trình duyệt — nếu không thấy file, dùng nút bên dưới";
+      } else {
+        task.message = "Trình duyệt này không tự lưu được video ghép — chọn cách tải bên dưới";
+      }
+      this.emit();
+    } catch (error) {
+      if (task.abort.signal.aborted) {
+        task.status = "cancelled";
+        task.message = "Đã hủy";
+      } else {
+        task.status = "error";
+        task.message = error instanceof Error ? error.message : "Lỗi không xác định";
+      }
+      this.emit();
+    }
+  }
+
+  /**
+   * Phân giải chuỗi nguồn (playlist / trang HTML ẩn luồng / file trực tiếp) mà
+   * KHÔNG tải toàn bộ video — chỉ đọc đủ để nhận dạng, rồi trả link cuối cùng.
+   */
+  private async resolveSourceForWebView(
+    task: TaskInternal,
+    url: string,
+    depth: number,
+  ): Promise<WebViewSave> {
+    const { res, finalUrl } = await this.fetchProxied(url, task);
+    if (!res.ok) {
+      throw new Error(
+        `Không lấy được dữ liệu video (HTTP ${res.status}) — link có thể đã hết hạn hoặc bị chặn theo vùng`,
+      );
+    }
+    const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
+    const hintsPlaylist =
+      /\.m3u8($|\?)/i.test(finalUrl) ||
+      contentType.includes("mpegurl") ||
+      contentType.includes("vnd.apple");
+    const hintsPage = contentType.includes("text/html") || contentType.includes("application/json");
+    if (!res.body) throw new Error("Không đọc được dữ liệu");
+
+    const reader = res.body.getReader();
+    const first = await reader.read();
+    if (first.done || !first.value) throw new Error("Phản hồi trống");
+    const head = first.value;
+    const sniff = new TextDecoder().decode(head.subarray(0, Math.min(head.length, 512))).trimStart();
+
+    const cancelReader = (): void => {
+      void reader.cancel().catch(() => undefined);
+    };
+
+    if (sniff.startsWith("#EXTM3U") || (hintsPlaylist && !hintsPage && !sniff.startsWith("<"))) {
+      cancelReader();
+      return { kind: "hls", url: finalUrl };
+    }
+
+    if (sniff.startsWith("<") || sniff.startsWith("{") || hintsPage) {
+      const chunks: Uint8Array[] = [];
+      let total = head.length;
+      for (;;) {
+        if (task.abort.signal.aborted) throw new DOMException("Aborted", "AbortError");
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.length) {
+          chunks.push(value);
+          total += value.length;
+        }
+      }
+      const all = new Uint8Array(total);
+      all.set(head, 0);
+      let offset = head.length;
+      for (const chunk of chunks) {
+        all.set(chunk, offset);
+        offset += chunk.length;
+      }
+      const html = new TextDecoder().decode(all);
+      const resolved = extractNguoncStreamUrl(html, finalUrl);
+      if (resolved && resolved !== url && depth < RESOLVE_MAX_DEPTH) {
+        return this.resolveSourceForWebView(task, resolved, depth + 1);
+      }
+      throw new Error("Không tìm thấy luồng video trong trang trả về");
+    }
+
+    // File nhị phân (mp4/ts trực tiếp) — trình duyệt tải thẳng được.
+    cancelReader();
+    return { kind: "direct", url: finalUrl };
   }
 
   private async downloadInto(
