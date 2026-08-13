@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { Share2 } from "lucide-react";
+import { Download, Share2 } from "lucide-react";
 
+import DownloadPanel from "@/components/DownloadPanel";
 import { HlsPlayer } from "@/components/HlsPlayer";
 import { toast } from "@/components/ui/sonner";
+import { downloadManager, pickExtension, sanitizeFileName } from "@/lib/downloader";
 import {
   getHubDetailAlternates,
   getHubDetailPrimary,
@@ -204,6 +206,20 @@ export default function PhimDetail() {
     });
   };
 
+  const startDownload = useCallback(
+    (episodeName: string, m3u8Url: string): void => {
+      if (!data) return;
+      const base = sanitizeFileName(`${data.title} - ${episodeName}`);
+      const added = downloadManager.add(
+        `${data.title} — ${episodeName}`,
+        m3u8Url,
+        `${base}${pickExtension(m3u8Url)}`,
+      );
+      if (!added) toast.info("Tập này đang được tải");
+    },
+    [data],
+  );
+
   const backHref = "/";
 
   return (
@@ -219,14 +235,26 @@ export default function PhimDetail() {
         >
           ← Về danh sách
         </Link>
-        <button
-          type="button"
-          onClick={() => void shareCurrentUrl()}
-          className="inline-flex min-h-10 items-center gap-1.5 rounded-md border bg-background px-3 text-sm font-medium transition hover:bg-muted"
-        >
-          <Share2 size={14} aria-hidden="true" />
-          Chia sẻ
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            disabled={!currentEp?.m3u8}
+            onClick={() => currentEp?.m3u8 && startDownload(currentEp.name || `Tập ${ep + 1}`, currentEp.m3u8)}
+            title={currentEp?.m3u8 ? "Tải tập đang xem về máy" : "Tập này chỉ có link nhúng, không hỗ trợ tải"}
+            className="inline-flex min-h-10 items-center gap-1.5 rounded-md border bg-background px-3 text-sm font-medium transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Download size={14} aria-hidden="true" />
+            Tải xuống
+          </button>
+          <button
+            type="button"
+            onClick={() => void shareCurrentUrl()}
+            className="inline-flex min-h-10 items-center gap-1.5 rounded-md border bg-background px-3 text-sm font-medium transition hover:bg-muted"
+          >
+            <Share2 size={14} aria-hidden="true" />
+            Chia sẻ
+          </button>
+        </div>
       </div>
 
       {isLoading && <p className="text-muted-foreground">Đang tải nguồn đã chọn…</p>}
@@ -308,14 +336,30 @@ export default function PhimDetail() {
               </div>
               <div className="grid grid-cols-4 gap-1.5 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-10">
                 {currentServer.episodes.map((e, i) => (
-                  <button
+                  <div
                     key={i}
-                    ref={i === ep ? activeEpRef : undefined}
-                    onClick={() => nav({ ep: i })}
-                    className={`rounded-md border px-2 py-1.5 text-xs ${i === ep ? "bg-primary text-primary-foreground" : "hover:bg-muted"}`}
+                    className={`flex items-stretch overflow-hidden rounded-md border ${
+                      i === ep ? "border-primary bg-primary text-primary-foreground" : "hover:bg-muted"
+                    }`}
                   >
-                    {e.name}
-                  </button>
+                    <button
+                      ref={i === ep ? activeEpRef : undefined}
+                      onClick={() => nav({ ep: i })}
+                      className="min-w-0 flex-1 px-2 py-1.5 text-xs"
+                    >
+                      {e.name}
+                    </button>
+                    {e.m3u8 && (
+                      <button
+                        onClick={() => startDownload(e.name || `Tập ${i + 1}`, e.m3u8)}
+                        aria-label={`Tải ${e.name}`}
+                        title={`Tải ${e.name}`}
+                        className="px-1.5 opacity-70 transition hover:opacity-100"
+                      >
+                        <Download size={12} aria-hidden="true" />
+                      </button>
+                    )}
+                  </div>
                 ))}
               </div>
             </div>
@@ -343,6 +387,8 @@ export default function PhimDetail() {
           </div>
         </>
       )}
+
+      <DownloadPanel />
     </div>
   );
 }
