@@ -52,7 +52,13 @@ export type HubDetail = {
   director?: string[];
   categories?: HubTag[];
   countries?: HubTag[];
-  bySource: Partial<Record<HubSource, { name: string; servers: HubServer[] } | { error: string }>>;
+  bySource: Partial<
+    Record<
+      HubSource,
+      | { name: string; servers: HubServer[]; categories?: HubTag[]; countries?: HubTag[] }
+      | { error: string }
+    >
+  >;
 };
 
 export type FilterOption = { slug: string; name: string };
@@ -434,8 +440,18 @@ function withTimeout<T>(request: Promise<T>, ms = 12_000): Promise<T> {
   ]);
 }
 
-function toSourceEntry(detail: SourceDetail): { name: string; servers: HubServer[] } {
-  return { name: detail.name, servers: detail.servers };
+function toSourceEntry(detail: SourceDetail): {
+  name: string;
+  servers: HubServer[];
+  categories?: HubTag[];
+  countries?: HubTag[];
+} {
+  return {
+    name: detail.name,
+    servers: detail.servers,
+    categories: detail.categories,
+    countries: detail.countries,
+  };
 }
 
 function toPrimaryDetail(slug: string, source: HubSource, detail: SourceDetail): HubDetail {
@@ -581,19 +597,51 @@ export async function getHubRelated(opts: {
     }
   };
 
-  const resolveSlug = (tag: HubTag): string | undefined => tag.slug || (tag.name ? deriveSlug(tag.name) : undefined);
+  // Slug của nguồn NC không dùng được với API KK → đối chiếu theo TÊN sang
+  // slug chuẩn của KK (qua danh sách thể loại/quốc gia KK) để gợi ý chạy đúng.
+  let nameToKkSlug = new Map<string, string>();
+  try {
+    const filters = await getHubFilters();
+    nameToKkSlug = new Map(
+      [...filters.categories, ...filters.countries].map((f) => [normalizeTitle(f.name), f.slug]),
+    );
+  } catch {
+    // Không lấy được danh sách KK — vẫn thử slug gốc/derive bên dưới.
+  }
+
+  const slugCandidates = (tag: HubTag): string[] => {
+    const out: string[] = [];
+    const push = (value: string | undefined): void => {
+      if (value && !out.includes(value)) out.push(value);
+    };
+    push(tag.slug);
+    push(tag.name ? deriveSlug(tag.name) : undefined);
+    push(tag.name ? nameToKkSlug.get(normalizeTitle(tag.name)) : undefined);
+    return out;
+  };
+
+  const loadByCandidates = async (
+    kind: "category" | "country",
+    tag: HubTag,
+  ): Promise<HubItem[]> => {
+    for (const slug of slugCandidates(tag)) {
+      const items = await loadKk(
+        kind === "category" ? { category: slug, country: "" } : { category: "", country: slug },
+      );
+      if (items.length > 0) return items;
+    }
+    return [];
+  };
 
   // Hàng "cùng thể loại": ưu tiên thể loại nội dung (bỏ qua Phim Bộ / Phim Lẻ), tối đa 2 thể loại.
   const genreCandidates = (opts.categories ?? []).filter(
     (c) => !FORMAT_CATEGORIES.has(normalizeTitle(c.name)),
   );
   const catCandidates = genreCandidates.length > 0 ? genreCandidates : (opts.categories ?? []);
-  const catSlugs = [...new Set(catCandidates.map(resolveSlug).filter((x): x is string => !!x))].slice(0, 2);
-  const catBatches = await Promise.all(catSlugs.map((slug) => loadKk({ category: slug, country: "" })));
   const catItems: HubItem[] = [];
   const catSeen = new Set<string>();
-  for (const batch of catBatches) {
-    for (const item of batch) {
+  for (const tag of catCandidates.slice(0, 2)) {
+    for (const item of await loadByCandidates("category", tag)) {
       if (catSeen.has(item.slug)) continue;
       catSeen.add(item.slug);
       catItems.push(item);
@@ -609,16 +657,16 @@ export async function getHubRelated(opts: {
   }
 
   // Hàng "cùng quốc gia".
-  const countrySlug = resolveSlug(opts.countries?.[0] ?? { name: "" });
-  if (countrySlug) {
-    const countryItems = (await loadKk({ category: "", country: countrySlug })).filter(
+  const countryTag = opts.countries?.[0];
+  if (countryTag) {
+    const countryItems = (await loadByCandidates("country", countryTag)).filter(
       (item) => !catSeen.has(item.slug),
     );
     if (countryItems.length > 0) {
       rows.push({
         key: "country",
         title: "Phim cùng quốc gia",
-        subtitle: opts.countries?.[0]?.name,
+        subtitle: countryTag.name,
         items: countryItems.slice(0, limit),
       });
     }

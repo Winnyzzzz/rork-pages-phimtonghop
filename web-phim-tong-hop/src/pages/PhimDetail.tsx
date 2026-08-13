@@ -207,14 +207,20 @@ export default function PhimDetail() {
   }, [data, currentEp, slug, server, ep, activeSource]);
 
   // Gợi ý phim tương tự (cùng thể loại / cùng quốc gia) từ KK.
+  // Ưu tiên thẻ từ chi tiết KK (slug chuẩn cho API KK) — mở phim từ nguồn NC
+  // vẫn có gợi ý nhờ nguồn KK đã được đối chiếu theo tên phim.
+  const kkAlternate = data?.bySource.kk;
+  const kkTags = kkAlternate && "servers" in kkAlternate ? kkAlternate : undefined;
+  const relatedCategories = kkTags?.categories ?? data?.categories ?? [];
+  const relatedCountries = kkTags?.countries ?? data?.countries ?? [];
   const { data: relatedData, isLoading: isLoadingRelated } = useQuery({
     queryKey: [
       "hub-related",
       slug,
       data?.title,
       data?.originName,
-      JSON.stringify(data?.categories ?? []),
-      JSON.stringify(data?.countries ?? []),
+      JSON.stringify(relatedCategories),
+      JSON.stringify(relatedCountries),
     ],
     queryFn: () =>
       getHubRelated({
@@ -222,8 +228,8 @@ export default function PhimDetail() {
         excludeTitles: [data!.title, data!.originName].filter(
           (value): value is string => typeof value === "string" && value.length > 0,
         ),
-        categories: data!.categories,
-        countries: data!.countries,
+        categories: relatedCategories,
+        countries: relatedCountries,
       }),
     enabled: !!data,
     staleTime: 30 * 60_000,
