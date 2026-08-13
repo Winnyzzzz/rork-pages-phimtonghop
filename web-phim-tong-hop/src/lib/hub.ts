@@ -142,14 +142,10 @@ type HubListResult = { items: HubItem[]; maxPage: number; error?: string };
 
 function listTitleKey(item: HubItem): string {
   const value = item.originName || item.title;
-  return value
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\u0111/g, "d")
-    .replace(/\u0110/g, "D")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
+  // Nếu tiêu đề ghi đầy đủ dấu thì giữ nguyên dấu để không gộp nhầm hai phim
+  // chỉ khác dấu (vd "Bất Tiện" của NC ≠ "Bát Tiên" của KK).
+  if (hasVietnameseDiacritics(value)) return rawTitleKey(value);
+  return normalizeTitle(value);
 }
 
 function mergeHubItems(items: HubItem[]): HubItem[] {
@@ -324,13 +320,45 @@ function normalizeTitle(v?: string): string {
     .trim();
 }
 
-/** Exact (normalized) title comparison. Substring matching is intentionally NOT used:
- * "Bát Tiên" would wrongly match "Đông Du Bát Tiên Phục Ma". */
+/** True when the string contains Vietnamese diacritics (incl. đ/Đ). */
+function hasVietnameseDiacritics(v: string): boolean {
+  return /[\u0300-\u036f]/.test(v.normalize("NFD")) || /[đĐ]/.test(v);
+}
+
+/** Case-insensitive key that KEEPS diacritics but drops punctuation. */
+function rawTitleKey(v: string): string {
+  return v
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Title equivalence for cross-source matching. When BOTH sides are written with
+ * full Vietnamese diacritics they must match exactly (e.g. "Bất Tiện" ≠ "Bát Tiên",
+ * two different movies). Only when one side omits diacritics do we compare
+ * diacritic-insensitively, so "Bat Tien" still matches "Bát Tiên".
+ */
+function titlesEquivalent(a?: string, b?: string): boolean {
+  if (!a || !b) return false;
+  const na = normalizeTitle(a);
+  const nb = normalizeTitle(b);
+  if (!na || !nb || na !== nb) return false;
+  if (hasVietnameseDiacritics(a) && hasVietnameseDiacritics(b)) {
+    return rawTitleKey(a) === rawTitleKey(b);
+  }
+  return true;
+}
+
+/** Exact title comparison. Substring matching is intentionally NOT used:
+ * "Bát Tiên" would wrongly match "Đông Du Bát Tiên Phục Ma".
+ * Diacritic-insensitive only when one side omits diacritics. */
 function titlesMatch(a: Pick<SourceDetail, "name" | "originName">, refName: string, refOrigin?: string): boolean {
-  const names = [normalizeTitle(a.name), normalizeTitle(a.originName)].filter(Boolean);
-  const refs = [normalizeTitle(refName), normalizeTitle(refOrigin)].filter(Boolean);
+  const names = [a.name, a.originName].filter(Boolean);
+  const refs = [refName, refOrigin].filter(Boolean);
   if (names.length === 0 || refs.length === 0) return false;
-  return names.some((n) => refs.some((r) => n === r));
+  return names.some((n) => refs.some((r) => titlesEquivalent(n, r)));
 }
 
 /** Finds the slug on `source` whose title matches the reference movie. */
