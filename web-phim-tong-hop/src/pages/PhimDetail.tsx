@@ -349,8 +349,17 @@ export default function PhimDetail() {
           </div>
 
           {/* Nguồn phát + server + tải xuống */}
-          <div className="mt-4 flex flex-wrap items-center gap-2">
-            <div className="inline-flex items-center gap-1 rounded-full border bg-muted/40 p-1">
+          <div className="mt-4 rounded-xl border bg-card p-3 shadow-sm sm:p-4">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Nguồn phát
+              </h2>
+              {isLoadingAlternates && (
+                <span className="text-xs text-muted-foreground">Đang bổ sung nguồn còn lại…</span>
+              )}
+            </div>
+
+            <div className="mt-2.5 grid grid-cols-2 gap-1 rounded-lg border bg-muted/50 p-1">
               {SOURCES.map((s) => {
                 const meta = SOURCE_META[s];
                 const src = data.bySource[s];
@@ -362,35 +371,39 @@ export default function PhimDetail() {
                     disabled={!ok}
                     onClick={() => nav({ from: s, server: 0, ep: 0 })}
                     title={isPending ? "Đang tải nguồn này…" : !ok ? "Nguồn này không có phim" : ""}
-                    className={`rounded-full px-3.5 py-1.5 text-sm font-semibold transition ${
+                    className={`flex min-w-0 items-center justify-center gap-1.5 rounded-md px-3 py-2 text-sm font-semibold transition ${
                       activeSource === s
-                        ? `${meta.color} text-white shadow`
+                        ? `${meta.color} text-white shadow-sm`
                         : ok
-                          ? "text-muted-foreground hover:text-foreground"
+                          ? "text-muted-foreground hover:bg-background hover:text-foreground"
                           : isPending
                             ? "text-muted-foreground opacity-70"
-                            : "text-muted-foreground/50 line-through opacity-60"
+                            : "text-muted-foreground/50 opacity-60"
                     }`}
                   >
-                    SV {meta.label}{isPending ? "…" : ""}
+                    {meta.label}
+                    {isPending ? "…" : ""}
                   </button>
                 );
               })}
             </div>
 
             {servers.length > 1 && (
-              <div className="flex flex-wrap gap-1.5">
-                {servers.map((s, i) => (
-                  <button
-                    key={i}
-                    onClick={() => nav({ server: i, ep: 0 })}
-                    className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
-                      i === server ? "bg-foreground text-background" : "hover:bg-muted"
-                    }`}
-                  >
-                    {s.name}
-                  </button>
-                ))}
+              <div className="mt-3">
+                <div className="mb-1.5 text-xs text-muted-foreground">Server:</div>
+                <div className="flex gap-1.5 overflow-x-auto pb-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden sm:flex-wrap">
+                  {servers.map((s, i) => (
+                    <button
+                      key={i}
+                      onClick={() => nav({ server: i, ep: 0 })}
+                      className={`shrink-0 whitespace-nowrap rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                        i === server ? "bg-foreground text-background" : "hover:bg-muted"
+                      }`}
+                    >
+                      {s.name}
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
 
@@ -405,16 +418,12 @@ export default function PhimDetail() {
                     : "Tập này chỉ có link nhúng — trình tải sẽ tự dò luồng video"
                   : "Tập này không có link tải"
               }
-              className="ml-auto inline-flex items-center gap-2 rounded-full bg-gradient-to-r from-emerald-500 to-sky-500 px-5 py-2 text-sm font-semibold text-white shadow-md transition hover:shadow-lg hover:brightness-110 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none disabled:hover:brightness-100"
+              className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-emerald-500 to-sky-500 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:shadow-md hover:brightness-110 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none disabled:hover:brightness-100"
             >
               <Download size={16} aria-hidden="true" />
               Tải xuống
             </button>
           </div>
-
-          {isLoadingAlternates && (
-            <p className="mt-2 text-xs text-muted-foreground">Đang bổ sung các nguồn còn lại…</p>
-          )}
 
           {currentServer && currentServer.episodes.length > 0 && (
             <section className="mt-8">

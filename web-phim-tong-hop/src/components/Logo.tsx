@@ -11,7 +11,7 @@ export function Logo({ size = 40 }: { size?: number }) {
       fill="none"
       xmlns="http://www.w3.org/2000/svg"
       role="img"
-      aria-label="Phim Tổng hợp"
+      aria-label="Phim Tổng Hợp"
       className="shrink-0"
     >
       <defs>

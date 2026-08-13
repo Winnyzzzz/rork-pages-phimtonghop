@@ -127,7 +127,7 @@ export default function BlvDetail() {
       <div className="sticky top-0 z-20 -mx-4 mb-4 flex items-center gap-3 border-b bg-background/85 px-4 py-2 backdrop-blur">
         <Link to="/" className="flex items-center gap-2 text-sm text-muted-foreground hover:underline">
           <Logo size={24} />
-          ← Phim Tổng hợp
+          ← Phim Tổng Hợp
         </Link>
         {detail && (
           <span className="hidden min-w-0 flex-1 truncate text-center text-sm font-medium text-muted-foreground sm:block">
@@ -174,22 +174,25 @@ export default function BlvDetail() {
       </div>
 
       {sources.length > 0 && (
-        <div className="mt-3 flex flex-wrap gap-2">
-          {sources.map((source, i) => (
-            <button
-              key={`${source.link}-${i}`}
-              type="button"
-              onClick={() => nav({ src: i })}
-              className={`rounded-md border px-3 py-1 text-xs transition ${
-                i === activeSrcIndex ? "border-primary bg-primary/10" : "hover:bg-muted"
-              }`}
-            >
-              {source.name}{" "}
-              <span className="text-muted-foreground">
-                ({isHlsLink(source.link) ? "HLS" : source.type})
-              </span>
-            </button>
-          ))}
+        <div className="mt-3">
+          <div className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">Nguồn phát</div>
+          <div className="flex gap-2 overflow-x-auto pb-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            {sources.map((source, i) => (
+              <button
+                key={`${source.link}-${i}`}
+                type="button"
+                onClick={() => nav({ src: i })}
+                className={`shrink-0 whitespace-nowrap rounded-md border px-3 py-1.5 text-xs transition ${
+                  i === activeSrcIndex ? "border-primary bg-primary/10 font-medium" : "hover:bg-muted"
+                }`}
+              >
+                {source.name}{" "}
+                <span className="text-muted-foreground">
+                  ({isHlsLink(source.link) ? "HLS" : source.type})
+                </span>
+              </button>
+            ))}
+          </div>
         </div>
       )}
 
@@ -198,13 +201,13 @@ export default function BlvDetail() {
           <div className="mb-2 text-xs uppercase tracking-wide text-muted-foreground">
             Chọn server
           </div>
-          <div className="flex flex-wrap gap-2">
+          <div className="flex gap-2 overflow-x-auto pb-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
             {servers.map((serverItem, i) => (
               <button
                 key={serverItem.name}
                 type="button"
                 onClick={() => nav({ server: i })}
-                className={`rounded-md border px-3 py-1.5 text-sm transition ${
+                className={`shrink-0 whitespace-nowrap rounded-md border px-3 py-1.5 text-sm transition ${
                   i === activeServerIndex
                     ? "border-primary bg-primary/10 font-medium"
                     : "hover:bg-muted"

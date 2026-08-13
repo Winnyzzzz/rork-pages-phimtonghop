@@ -58,7 +58,7 @@ export default function BlvList() {
         <div className="flex items-center gap-3">
           <Logo size={40} />
           <div>
-            <h1 className="text-2xl font-bold">Phim BL</h1>
+            <h1 className="text-2xl font-bold">Boy Love</h1>
             <a
               href={BLV_HOME_URL}
               target="_blank"
@@ -69,19 +69,19 @@ export default function BlvList() {
             </a>
           </div>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 sm:flex-none">
           <Link
             to="/"
-            className="rounded-md border bg-background px-3 py-2 text-sm transition hover:bg-muted"
+            className="shrink-0 rounded-md border bg-background px-3 py-2 text-sm transition hover:bg-muted"
           >
-            ← Phim Tổng hợp
+            ← Phim Tổng Hợp
           </Link>
-          <div className="relative">
+          <div className="relative min-w-0 flex-1 sm:w-56 sm:flex-none">
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Tìm phim BL…"
-              className="w-56 rounded-md border bg-background px-3 py-2 pr-9 text-sm"
+              placeholder="Tìm phim Boy Love…"
+              className="w-full rounded-md border bg-background px-3 py-2 pr-9 text-sm"
             />
             {query !== "" && (
               <button
@@ -100,7 +100,7 @@ export default function BlvList() {
 
       {loadError && (
         <p className="mb-4 text-sm text-destructive">
-          Không tải được danh sách phim BL. Vui lòng thử lại sau.
+          Không tải được danh sách phim Boy Love. Vui lòng thử lại sau.
         </p>
       )}
 

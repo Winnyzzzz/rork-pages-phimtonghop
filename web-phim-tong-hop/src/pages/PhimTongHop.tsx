@@ -186,7 +186,7 @@ export default function PhimTongHop() {
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <Logo size={40} />
-          <h1 className="text-2xl font-bold">Phim Tổng hợp</h1>
+          <h1 className="text-2xl font-bold">Phim Tổng Hợp</h1>
         </div>
         <form
           onSubmit={(e) => {
@@ -199,14 +199,14 @@ export default function PhimTongHop() {
             }
             applyFilters({ q: nextQ, category: "", country: "", year: "" });
           }}
-          className="flex gap-2"
+          className="flex w-full gap-2 sm:w-auto"
         >
-          <div className="relative">
+          <div className="relative min-w-0 flex-1 sm:w-56 sm:flex-none">
             <input
               value={qInput}
               onChange={(e) => onSearchInput(e.target.value)}
               placeholder="Tìm phim…"
-              className="w-56 rounded-md border bg-background px-3 py-2 pr-9 text-sm"
+              className="w-full rounded-md border bg-background px-3 py-2 pr-9 text-sm"
             />
             {qInput !== "" && (
               <button
@@ -224,30 +224,33 @@ export default function PhimTongHop() {
         </form>
       </div>
 
-      <div className="mb-3 flex flex-wrap items-center gap-2">
-        {TABS.map((tab) => (
-          <button
-            key={tab.key}
-            onClick={() => applyFilters({ source: tab.key })}
-            className={`rounded-full px-4 py-1.5 text-sm font-medium transition ${
-              source === tab.key ? `${tab.color} text-white shadow` : "border bg-background hover:bg-muted"
-            }`}
+      {/* Dải chọn nguồn: cuộn ngang trên mobile, nút bộ lọc luôn neo bên phải */}
+      <div className="mb-3 flex items-center gap-2">
+        <div className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto pb-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          {TABS.map((tab) => (
+            <button
+              key={tab.key}
+              onClick={() => applyFilters({ source: tab.key })}
+              className={`shrink-0 rounded-full px-4 py-1.5 text-sm font-medium transition ${
+                source === tab.key ? `${tab.color} text-white shadow` : "border bg-background hover:bg-muted"
+              }`}
+            >
+              {tab.label}
+            </button>
+          ))}
+          <Link
+            to="/blv"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-rose-200 bg-rose-50 px-4 py-1.5 text-sm font-medium text-rose-600 transition hover:bg-rose-100"
           >
-            {tab.label}
-          </button>
-        ))}
-        <Link
-          to="/blv"
-          className="inline-flex items-center gap-1.5 rounded-full border border-rose-200 bg-rose-50 px-4 py-1.5 text-sm font-medium text-rose-600 transition hover:bg-rose-100"
-        >
-          <Heart size={14} aria-hidden="true" />
-          Phim BL
-        </Link>
+            <Heart size={14} aria-hidden="true" />
+            Boy Love
+          </Link>
+        </div>
         {!q && (
           <button
             type="button"
             onClick={() => setFiltersOpen(true)}
-            className="ml-auto inline-flex min-h-9 items-center gap-1.5 rounded-full border bg-background px-4 py-1.5 text-sm font-medium transition hover:bg-muted lg:hidden"
+            className="inline-flex min-h-9 shrink-0 items-center gap-1.5 rounded-full border bg-background px-4 py-1.5 text-sm font-medium transition hover:bg-muted lg:hidden"
           >
             <SlidersHorizontal size={14} aria-hidden="true" />
             Bộ lọc
@@ -362,10 +365,11 @@ export default function PhimTongHop() {
             type="button"
             aria-label="Đóng bộ lọc"
             onClick={() => setFiltersOpen(false)}
-            className="absolute inset-0 h-full w-full cursor-default bg-black/50"
+            className="absolute inset-0 h-full w-full cursor-default bg-black/50 animate-in fade-in-0"
           />
-          <div className="absolute right-0 top-0 flex h-full w-[19rem] max-w-[88vw] flex-col overflow-y-auto border-l bg-background p-4 shadow-2xl">
-            <div className="mb-4 flex items-center justify-between">
+          <div className="absolute inset-x-0 bottom-0 max-h-[85vh] overflow-y-auto rounded-t-2xl border-t bg-background px-4 pb-6 pt-2 shadow-2xl animate-in slide-in-from-bottom duration-300">
+            <div className="mx-auto mb-3 h-1 w-10 rounded-full bg-muted" aria-hidden="true" />
+            <div className="mb-3 flex items-center justify-between">
               <h2 className="text-sm font-semibold">Bộ lọc</h2>
               <button
                 type="button"
