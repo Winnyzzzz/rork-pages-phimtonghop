@@ -188,6 +188,8 @@ export default function PhimDetail() {
   const dlUrl = currentEp?.m3u8 || currentEp?.embed || "";
 
   useEffect(() => {
+    if (!data || !currentEp) return;
+    saveWatchMemory("hub", slug, { server, ep, from: activeSource });
   }, [data, currentEp, slug, server, ep, activeSource]);
 
   const scrollPlayerIntoView = useCallback((): void => {
