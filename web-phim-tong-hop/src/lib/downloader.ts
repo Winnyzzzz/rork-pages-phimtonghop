@@ -983,12 +983,17 @@ class DownloadManager {
     const kept = parsed.segments.slice(skipCount);
     const keptDuration = parsed.totalDuration - skippedDuration;
 
-    // ---- Dò codec từng phân đoạn để nhận ra các khối mã hóa khác nhau ----
+    // ---- Dò codec theo MẪU để nhận ra các khối mã hóa khác nhau ----
     // (trailer ghép trước tập phim, đoạn convertv8…). Khi toàn bộ phần giữ lại
     // là H.264 + AAC, đóng gói lại MP4 với dòng thời gian liền mạch thay vì ghép
     // thô TS — ghép thô nhiều luồng khác nhau khiến trình phát chỉ xem được
     // một phần file.
-    const PROBE_BYTES = 512 * 1024;
+    //
+    // Không dò từng đoạn một (hàng trăm request trước khi tải khiến bước này
+    // kéo dài nhiều phút): dò dày đoạn đầu, lấy mẫu thưa phần còn lại, rồi tìm
+    // kiếm nhị phân để xác định CHÍNH XÁC ranh giới khối mở đầu — tránh bỏ khối
+    // mở đầu quá tay làm cắt nhầm phần đầu tập phim.
+    const PROBE_BYTES = 256 * 1024;
     const probes: (TsProbe | null)[] = new Array<TsProbe | null>(kept.length).fill(null);
     const probeable =
       kept.length >= 2 &&
@@ -997,29 +1002,80 @@ class DownloadManager {
     if (probeable) {
       task.message = "Đang phân tích định dạng luồng…";
       this.emit();
+
+      const DENSE_START = 12; // dò dày đoạn đầu (vùng trailer/intro)
+      const SAMPLE_EVERY = 8; // sau đó lấy mẫu mỗi 8 đoạn
+      const probeQueue: number[] = [];
+      for (let i = 0; i < kept.length; i += 1) {
+        if (i < DENSE_START || i === kept.length - 1 || (i - DENSE_START) % SAMPLE_EVERY === 0) {
+          probeQueue.push(i);
+        }
+      }
+      const probeResults = new Map<number, TsProbe | null>();
+      const probeOne = async (index: number): Promise<void> => {
+        if (probeResults.has(index)) return;
+        let probe: TsProbe | null = null;
+        try {
+          const { res } = await this.fetchProxied(kept[index].url, task, {
+            offset: 0,
+            length: PROBE_BYTES,
+          });
+          if (res.ok) {
+            const bytes = new Uint8Array(await res.arrayBuffer());
+            if (bytes.length >= 188 * 2 && bytes[0] === 0x47) probe = probeTsSegment(bytes);
+          }
+        } catch {
+          // Không dò được phân đoạn này — giả định cùng luồng với lân cận.
+        }
+        probeResults.set(index, probe);
+      };
       let nextProbe = 0;
       const probeWorker = async (): Promise<void> => {
         for (;;) {
           if (task.abort.signal.aborted) throw new DOMException("Aborted", "AbortError");
-          const index = nextProbe;
-          if (index >= kept.length) return;
-          nextProbe += 1;
-          try {
-            const { res } = await this.fetchProxied(kept[index].url, task, {
-              offset: 0,
-              length: PROBE_BYTES,
-            });
-            if (!res.ok) continue;
-            const bytes = new Uint8Array(await res.arrayBuffer());
-            if (bytes.length < 188 * 2 || bytes[0] !== 0x47) continue;
-            const probe = probeTsSegment(bytes);
-            if (probe) probes[index] = probe;
-          } catch {
-            // Không dò được phân đoạn này — sẽ tắt đường đóng gói MP4 bên dưới.
-          }
+          const cursor = nextProbe;
+          if (cursor >= probeQueue.length) return;
+          nextProbe = cursor + 1;
+          await probeOne(probeQueue[cursor]);
         }
       };
-      await Promise.all(Array.from({ length: 4 }, () => probeWorker()));
+      await Promise.all(Array.from({ length: 6 }, () => probeWorker()));
+
+      // Làm rõ ranh giới khối mở đầu nằm giữa hai mẫu thưa bằng tìm kiếm nhị
+      // phân — nếu không, việc bỏ khối mở đầu có thể cắt nhầm phần đầu tập phim.
+      const firstProbe = probeResults.get(0) ?? null;
+      if (firstProbe) {
+        const probedIndices = Array.from(probeResults.keys()).sort((a, b) => a - b);
+        for (let k = 1; k < probedIndices.length; k += 1) {
+          const leftIdx = probedIndices[k - 1];
+          const rightIdx = probedIndices[k];
+          const left = probeResults.get(leftIdx) ?? null;
+          const right = probeResults.get(rightIdx) ?? null;
+          if (left && left.profileKey !== firstProbe.profileKey) break; // đã hết khối mở đầu
+          if (left && right && left.profileKey === right.profileKey) continue;
+          let a = leftIdx;
+          let b = rightIdx;
+          while (b - a > 1) {
+            if (task.abort.signal.aborted) throw new DOMException("Aborted", "AbortError");
+            const mid = (a + b) >> 1;
+            await probeOne(mid);
+            const midProbe = probeResults.get(mid) ?? null;
+            // Dò lỗi ở giữa → thu ranh giới về trước (giữ lại nội dung, không cắt nhầm).
+            if (midProbe && midProbe.profileKey === firstProbe.profileKey) a = mid;
+            else b = mid;
+          }
+          break;
+        }
+      }
+
+      // Đoạn không lấy mẫu thừa hưởng profile của mẫu gần nhất phía trước;
+      // mẫu dò lỗi (null) không làm mất profile đang có — giả định cùng luồng.
+      let carry: TsProbe | null = null;
+      for (let i = 0; i < kept.length; i += 1) {
+        const result = probeResults.get(i);
+        if (result) carry = result;
+        probes[i] = carry;
+      }
     }
 
     // Gom các phân đoạn liên tiếp cùng "profile" (codec + chữ ký SPS + codec âm thanh)
