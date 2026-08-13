@@ -56,7 +56,9 @@ function normalizeListState(raw: ListState | null): SearchState {
   return {
     source,
     page,
-    q: typeof raw?.q === "string" ? raw.q : "",
+    // Không khôi phục từ khóa tìm kiếm đã lưu — reload luôn quay về trang chủ
+    // (tìm kiếm chỉ áp dụng trong phiên, không cần nhớ lại).
+    q: "",
     category: typeof raw?.category === "string" ? raw.category : "",
     country: typeof raw?.country === "string" ? raw.country : "",
     year: typeof raw?.year === "string" ? raw.year : "",
@@ -71,6 +73,7 @@ export default function PhimTongHop() {
   const [filtersOpen, setFiltersOpen] = useState<boolean>(false);
   const scope = `hub:${source}:${page}:${q}:${category}:${country}:${year}`;
   const restoredRef = useRef<boolean>(false);
+  const searchResetTimerRef = useRef<number | undefined>(undefined);
 
   const { data: filters, isLoading: isLoadingFilters } = useQuery({
     queryKey: ["hub-filters"],
@@ -126,6 +129,34 @@ export default function PhimTongHop() {
 
   useEffect(() => setQInput(q), [q]);
 
+  // Dọn timer khi rời trang (tránh reset state sau khi unmount).
+  useEffect(
+    () => () => window.clearTimeout(searchResetTimerRef.current),
+    [],
+  );
+
+  /** Xóa tìm kiếm và quay về trang chủ ngay lập tức. */
+  const clearSearch = useCallback((): void => {
+    window.clearTimeout(searchResetTimerRef.current);
+    setQInput("");
+    goto({ q: "", category: "", country: "", year: "", page: 1 });
+  }, [goto]);
+
+  /** Khi đang tìm kiếm mà người dùng xóa hết chữ → tự quay về trang chủ sau 700ms
+   * (hủy nếu họ gõ tiếp, tránh nhấp nháy khi gõ lại từ khóa mới). */
+  const onSearchInput = useCallback(
+    (value: string): void => {
+      setQInput(value);
+      window.clearTimeout(searchResetTimerRef.current);
+      if (value.trim() === "" && q) {
+        searchResetTimerRef.current = window.setTimeout(() => {
+          goto({ q: "", category: "", country: "", year: "", page: 1 });
+        }, 700);
+      }
+    },
+    [goto, q],
+  );
+
   useEffect(() => {
     saveListState(state);
   }, [state]);
@@ -159,16 +190,35 @@ export default function PhimTongHop() {
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            applyFilters({ q: qInput.trim(), category: "", country: "", year: "" });
+            const nextQ = qInput.trim();
+            if (!nextQ && q) {
+              // Nhấn Tìm với ô trống khi đang tìm → quay về trang chủ.
+              clearSearch();
+              return;
+            }
+            applyFilters({ q: nextQ, category: "", country: "", year: "" });
           }}
           className="flex gap-2"
         >
-          <input
-            value={qInput}
-            onChange={(e) => setQInput(e.target.value)}
-            placeholder="Tìm phim…"
-            className="w-56 rounded-md border bg-background px-3 py-2 text-sm"
-          />
+          <div className="relative">
+            <input
+              value={qInput}
+              onChange={(e) => onSearchInput(e.target.value)}
+              placeholder="Tìm phim…"
+              className="w-56 rounded-md border bg-background px-3 py-2 pr-9 text-sm"
+            />
+            {qInput !== "" && (
+              <button
+                type="button"
+                onClick={clearSearch}
+                aria-label="Xóa tìm kiếm"
+                title="Xóa tìm kiếm"
+                className="absolute right-1.5 top-1/2 inline-flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-muted-foreground transition hover:bg-muted hover:text-foreground"
+              >
+                <X size={14} aria-hidden="true" />
+              </button>
+            )}
+          </div>
           <button className="rounded-md border px-3 py-2 text-sm">Tìm</button>
         </form>
       </div>
