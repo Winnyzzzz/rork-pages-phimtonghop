@@ -19,12 +19,14 @@ function decodeBase64Url(encoded: string): string {
 function buildResponse(upstream: Response): Response {
   const headers = new Headers();
   headers.set("Access-Control-Allow-Origin", "*");
-  headers.set("Access-Control-Expose-Headers", "x-final-url, content-length, content-type");
+  headers.set("Access-Control-Expose-Headers", "x-final-url, content-length, content-type, content-range");
   headers.set("Cache-Control", "public, max-age=3600");
   const contentType = upstream.headers.get("content-type");
   if (contentType) headers.set("Content-Type", contentType);
   const contentLength = upstream.headers.get("content-length");
   if (contentLength) headers.set("Content-Length", contentLength);
+  const contentRange = upstream.headers.get("content-range");
+  if (contentRange) headers.set("Content-Range", contentRange);
   const acceptRanges = upstream.headers.get("accept-ranges");
   if (acceptRanges) headers.set("Accept-Ranges", acceptRanges);
   // URL cuối cùng sau redirect — client cần để resolve đúng đường dẫn
@@ -39,8 +41,8 @@ export const onRequestOptions = (): Response =>
     headers: {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, OPTIONS",
-      "Access-Control-Allow-Headers": "x-dl-key, x-dl-referer",
-      "Access-Control-Expose-Headers": "x-final-url, content-length, content-type",
+      "Access-Control-Allow-Headers": "x-dl-key, x-dl-referer, x-dl-range",
+      "Access-Control-Expose-Headers": "x-final-url, content-length, content-type, content-range",
     },
   });
 
@@ -82,12 +84,14 @@ export const onRequestGet = async (context: {
   refererAttempts.push(null);
 
   let lastResponse: Response | null = null;
+  const rangeHeader = request.headers.get("x-dl-range");
   for (const referer of refererAttempts) {
     const headers: Record<string, string> = {
       "user-agent": BROWSER_UA,
       accept: "*/*",
     };
     if (referer) headers.referer = referer;
+    if (rangeHeader) headers.range = rangeHeader;
     try {
       const upstream = await fetch(target, {
         redirect: "follow",

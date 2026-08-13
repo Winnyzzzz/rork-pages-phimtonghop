@@ -1,12 +1,17 @@
 // Trình tải video (m3u8 HLS / link trực tiếp):
-//  - Ưu tiên tải qua proxy /download/* để tránh lỗi CORS/redirect; proxy thử nhiều
-//    kiểu Referer (NguonC kiểm tra khắt khe) và trả về URL cuối cùng sau redirect
-//    để client resolve đúng đường dẫn phân đoạn.
-//  - Dữ liệu được đệm vào OPFS (đĩa ảo của origin, không tốn RAM). Khi xong, một
-//    service worker nhỏ stream file từ OPFS kèm Content-Length — trình duyệt hiện
-//    đúng dung lượng và chép vào mục Tải xuống gần như ngay lập tức.
-//  - Không có SW/OPFS: file nhỏ chép sang Blob bộ nhớ rồi lưu; trình duyệt cũ
-//    dồn vào bộ nhớ từ đầu.
+//  - Tải qua proxy /download/* để tránh CORS/redirect; proxy thử nhiều kiểu Referer
+//    và trả x-final-url (URL cuối sau redirect). Một số CDN (kkphimplayer…) chặn IP
+//    nước ngoài nên proxy nhận 404 — client tự nhớ host đó và chuyển sang tải trực
+//    tiếp từ trình duyệt người dùng.
+//  - Phân đoạn HLS được tải song song NHƯNG ghi vào file theo ĐÚNG THỨ TỰ playlist
+//    (ghi lộn thứ tự làm hỏng dòng MPEG-TS → file tải về xem bị cắt/giật).
+//  - Kiểm tra dữ liệu từng phân đoạn (sync byte TS / box MP4) và thử lại tối đa 3
+//    lần — bắt lỗi máy chủ trả trang lỗi HTML thay vì video (file "đủ dung lượng
+//    nhưng chỉ xem được vài giây").
+//  - Hỗ trợ fMP4 (#EXT-X-MAP): ghép init segment vào đầu, lưu đuôi .mp4 hợp lệ.
+//    Hỗ trợ #EXT-X-BYTERANGE (Range request) và xoay khóa AES-128 giữa playlist.
+//  - Dữ liệu đệm vào OPFS; khi xong, service worker stream file kèm Content-Length
+//    để trình duyệt hiện đúng dung lượng và chép vào mục Tải xuống ngay.
 
 export type DownloadStatus = "queued" | "active" | "done" | "error" | "cancelled";
 
@@ -29,18 +34,33 @@ type TaskInternal = DownloadTask & {
   lastBytes: number;
 };
 
-type KeyInfo = { uri: string; ivHex?: string };
-type Segment = { url: string };
+type KeyRef = { uri?: string; ivHex?: string };
+type RangeRef = { length: number; offset: number };
+type SegmentMeta = {
+  url: string;
+  key?: KeyRef;
+  byteRange?: RangeRef;
+  map?: { url: string; byteRange?: RangeRef };
+};
+type ParsedPlaylist = {
+  segments: SegmentMeta[];
+  mediaSequence: number;
+  totalDuration: number;
+  hasMap: boolean;
+  isEndList: boolean;
+  hasDiscontinuity: boolean;
+};
 type ProxiedResponse = { res: Response; finalUrl: string };
 type FinishedBuffer = { blob: Blob; opfsName: string | null; size: number };
 type BufferSink = {
   append: (bytes: Uint8Array) => Promise<void>;
-  finish: () => Promise<FinishedBuffer>;
+  finish: (mime: string) => Promise<FinishedBuffer>;
   abort: () => Promise<void>;
 };
 
 const DL_KEY = "phim-tl-2026";
 const CONCURRENCY = 3;
+const SEGMENT_ATTEMPTS = 3;
 const MEMORY_BLOB_LIMIT = 512 * 1024 * 1024;
 const RESOLVE_MAX_DEPTH = 3;
 const OPFS_DIR = "video-downloads";
@@ -103,6 +123,15 @@ export function pickExtension(url: string): string {
   return ".mp4";
 }
 
+function formatDuration(totalSeconds: number): string {
+  const s = Math.round(totalSeconds);
+  const hours = Math.floor(s / 3600);
+  const minutes = Math.floor((s % 3600) / 60);
+  const seconds = s % 60;
+  if (hours > 0) return `${hours}h${minutes}p`;
+  return `${minutes}p${seconds}s`;
+}
+
 function parseAttrs(source: string): Record<string, string> {
   const out: Record<string, string> = {};
   const re = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/g;
@@ -111,6 +140,15 @@ function parseAttrs(source: string): Record<string, string> {
     out[match[1]] = match[2].replace(/^"|"$/g, "");
   }
   return out;
+}
+
+function parseByteRange(source: string | undefined): RangeRef | undefined {
+  if (!source) return undefined;
+  const [lengthPart, offsetPart] = source.trim().split("@");
+  const length = parseInt(lengthPart, 10);
+  if (!Number.isFinite(length) || length <= 0) return undefined;
+  const offset = parseInt(offsetPart ?? "0", 10);
+  return { length, offset: Number.isFinite(offset) && offset >= 0 ? offset : 0 };
 }
 
 function pickBestVariant(text: string, baseUrl: string): string {
@@ -129,9 +167,11 @@ function pickBestVariant(text: string, baseUrl: string): string {
     const next = lines[i + 1]?.trim() ?? "";
     if (!next || next.startsWith("#")) continue;
     const url = new URL(next, baseUrl).href;
-    // Ưu tiên BANDWIDTH; playlist thiếu BANDWIDTH thì dùng độ phân giải; thiếu nữa thì luồng đầu tiên.
     const bandwidth = parseInt(attrs.BANDWIDTH ?? "0", 10) || 0;
-    const score = bandwidth > 0 ? bandwidth * 10_000 + resolutionScore(attrs.RESOLUTION) : resolutionScore(attrs.RESOLUTION);
+    const score =
+      bandwidth > 0
+        ? bandwidth * 10_000 + resolutionScore(attrs.RESOLUTION)
+        : resolutionScore(attrs.RESOLUTION);
     if (score > bestScore) {
       bestScore = score;
       bestUrl = url;
@@ -141,36 +181,71 @@ function pickBestVariant(text: string, baseUrl: string): string {
   return bestUrl;
 }
 
-function parseMediaPlaylist(
-  text: string,
-  baseUrl: string,
-): { segments: Segment[]; keyInfo: KeyInfo | null; mediaSequence: number } {
+function parseMediaPlaylist(text: string, baseUrl: string): ParsedPlaylist {
   const lines = text.split(/\r?\n/);
-  const segments: Segment[] = [];
-  let keyInfo: KeyInfo | null = null;
+  const segments: SegmentMeta[] = [];
   let mediaSequence = 0;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
+  let totalDuration = 0;
+  let currentKey: KeyRef | undefined;
+  let currentMap: SegmentMeta["map"];
+  let pendingRange: RangeRef | undefined;
+  let hasMap = false;
+  let isEndList = false;
+  let hasDiscontinuity = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
     if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
-      mediaSequence = parseInt(line.split(":")[1], 10) || 0;
+      mediaSequence = parseInt(line.slice(22), 10) || 0;
+    } else if (line.startsWith("#EXTINF")) {
+      totalDuration += parseFloat(line.slice(8).split(",")[0]) || 0;
     } else if (line.startsWith("#EXT-X-KEY:")) {
       const attrs = parseAttrs(line.slice(11));
-      if (attrs.METHOD === "AES-128" && attrs.URI) {
-        keyInfo = { uri: new URL(attrs.URI, baseUrl).href, ivHex: attrs.IV };
-      } else if (attrs.METHOD && attrs.METHOD !== "NONE") {
-        throw new Error(`Luồng dùng mã hóa không hỗ trợ (${attrs.METHOD})`);
+      const method = (attrs.METHOD ?? "").toUpperCase();
+      if (method && method !== "NONE") {
+        if (method !== "AES-128") throw new Error(`Luồng dùng mã hóa không hỗ trợ (${method})`);
+        currentKey = {
+          uri: attrs.URI ? new URL(attrs.URI, baseUrl).href : undefined,
+          ivHex: attrs.IV,
+        };
+      } else {
+        currentKey = undefined;
       }
-    } else if (line && !line.startsWith("#")) {
-      segments.push({ url: new URL(line, baseUrl).href });
+    } else if (line.startsWith("#EXT-X-MAP:")) {
+      const attrs = parseAttrs(line.slice(11));
+      if (attrs.URI) {
+        currentMap = {
+          url: new URL(attrs.URI, baseUrl).href,
+          byteRange: parseByteRange(attrs.BYTERANGE),
+        };
+        hasMap = true;
+      }
+    } else if (line.startsWith("#EXT-X-BYTERANGE:")) {
+      pendingRange = parseByteRange(line.slice(17));
+    } else if (line.startsWith("#EXT-X-DISCONTINUITY")) {
+      hasDiscontinuity = true;
+      // MAP không còn hiệu lực sau discontinuity (spec HLS).
+      currentMap = undefined;
+    } else if (line.startsWith("#EXT-X-ENDLIST")) {
+      isEndList = true;
+    } else if (!line.startsWith("#")) {
+      segments.push({
+        url: new URL(line, baseUrl).href,
+        key: currentKey,
+        byteRange: pendingRange,
+        map: currentMap,
+      });
+      pendingRange = undefined;
     }
   }
-  return { segments, keyInfo, mediaSequence };
+  return { segments, mediaSequence, totalDuration, hasMap, isEndList, hasDiscontinuity };
 }
 
-function ivFor(keyInfo: KeyInfo, sequence: number): Uint8Array {
+function ivFor(ivHex: string | undefined, sequence: number): Uint8Array {
   const bytes = new Uint8Array(16);
-  if (keyInfo.ivHex) {
-    const hex = keyInfo.ivHex.startsWith("0x") ? keyInfo.ivHex.slice(2) : keyInfo.ivHex;
+  if (ivHex) {
+    const hex = ivHex.startsWith("0x") ? ivHex.slice(2) : ivHex;
     for (let i = 0; i < 16; i++) {
       bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
     }
@@ -180,7 +255,11 @@ function ivFor(keyInfo: KeyInfo, sequence: number): Uint8Array {
   return bytes;
 }
 
-async function decryptAes128(data: ArrayBuffer, keyBytes: ArrayBuffer, iv: Uint8Array): Promise<ArrayBuffer> {
+async function decryptAes128(
+  data: ArrayBuffer,
+  keyBytes: ArrayBuffer,
+  iv: Uint8Array,
+): Promise<ArrayBuffer> {
   const key = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-CBC" }, false, ["decrypt"]);
   return crypto.subtle.decrypt({ name: "AES-CBC", iv: iv as unknown as BufferSource }, key, data);
 }
@@ -225,7 +304,6 @@ function ensureDownloadSw(): Promise<boolean> {
         new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
       ]);
       if (!ready) return false;
-      // Kiểm tra SW đã thực sự kiểm soát trang bằng một yêu cầu ping.
       for (let attempt = 0; attempt < 6; attempt += 1) {
         try {
           const res = await fetch("/sw-download/ping", { cache: "no-store" });
@@ -247,7 +325,6 @@ async function createOpfsSink(): Promise<BufferSink | null> {
   try {
     const root = await navigator.storage.getDirectory();
     const dir = await root.getDirectoryHandle(OPFS_DIR, { create: true });
-    // Dọn file tạm quá 1 giờ (trình duyệt đã chép xong từ lần trước hoặc tải hỏng).
     for await (const [name] of dir.entries()) {
       const match = /^v-(\d+)-/.exec(name);
       if (match && Date.now() - Number(match[1]) > 3_600_000) {
@@ -276,13 +353,13 @@ async function createOpfsSink(): Promise<BufferSink | null> {
   }
 }
 
-function createMemorySink(mime: string): BufferSink {
+function createMemorySink(): BufferSink {
   const chunks: BlobPart[] = [];
   return {
     append: async (bytes: Uint8Array) => {
       chunks.push(bytes.buffer as ArrayBuffer);
     },
-    finish: async () => {
+    finish: async (mime: string) => {
       const blob = new Blob(chunks, { type: mime });
       return { blob, opfsName: null, size: blob.size };
     },
@@ -290,10 +367,7 @@ function createMemorySink(mime: string): BufferSink {
   };
 }
 
-/**
- * Một số nguồn (NguonC…) trả về trang HTML ẩn URL luồng thay vì playlist trực tiếp.
- * Trích các dạng phổ biến: encryptedURL → conf.php?url=, streamURL/file:/url =, script src chứa .m3u8.
- */
+/** Một số nguồn (NguonC…) trả về trang HTML ẩn URL luồng thay vì playlist trực tiếp. */
 function extractNguoncStreamUrl(html: string, baseUrl: string): string | null {
   const toAbs = (candidate: string): string | null => {
     if (!candidate) return null;
@@ -332,6 +406,7 @@ class DownloadManager {
   private snapshot: DownloadTask[] = [];
   private listeners = new Set<() => void>();
   private running = false;
+  private proxyDeadHosts = new Set<string>();
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -424,21 +499,42 @@ class DownloadManager {
     }
   }
 
-  private async fetchProxied(url: string, task: TaskInternal): Promise<ProxiedResponse> {
-    const headers: Record<string, string> = { "x-dl-key": DL_KEY };
-    const referer = siteRefererFor(url);
-    if (referer) headers["x-dl-referer"] = referer;
-    const proxied = await fetch(proxyUrlFor(url), {
-      signal: task.abort.signal,
-      headers,
-    }).catch(() => null);
-    if (proxied && proxied.ok) {
-      const contentType = (proxied.headers.get("content-type") ?? "").toLowerCase();
-      if (!contentType.includes("text/html")) {
-        return { res: proxied, finalUrl: proxied.headers.get("x-final-url") || url };
+  /**
+   * Tải 1 URL qua proxy rồi mới tải trực tiếp khi proxy lỗi. Host từng bị proxy
+   * trả non-ok (CDN chặn IP nước ngoài…) được nhớ để bỏ qua proxy từ lần sau.
+   */
+  private async fetchProxied(
+    url: string,
+    task: TaskInternal,
+    range?: RangeRef,
+  ): Promise<ProxiedResponse> {
+    let host = "";
+    try {
+      host = new URL(url).hostname;
+    } catch {
+      // host rỗng → bỏ qua proxy
+    }
+    if (host && !this.proxyDeadHosts.has(host)) {
+      const headers: Record<string, string> = { "x-dl-key": DL_KEY };
+      const referer = siteRefererFor(url);
+      if (referer) headers["x-dl-referer"] = referer;
+      if (range) headers["x-dl-range"] = `bytes=${range.offset}-${range.offset + range.length - 1}`;
+      try {
+        const proxied = await fetch(proxyUrlFor(url), {
+          signal: task.abort.signal,
+          headers,
+        });
+        if (proxied.ok) {
+          return { res: proxied, finalUrl: proxied.headers.get("x-final-url") || url };
+        }
+        this.proxyDeadHosts.add(host);
+      } catch {
+        // lỗi mạng/hủy — thử tải trực tiếp, không kết luận host chết
       }
     }
-    const direct = await fetch(url, { signal: task.abort.signal });
+    const directHeaders: Record<string, string> = {};
+    if (range) directHeaders.range = `bytes=${range.offset}-${range.offset + range.length - 1}`;
+    const direct = await fetch(url, { signal: task.abort.signal, headers: directHeaders });
     return { res: direct, finalUrl: direct.url || url };
   }
 
@@ -455,28 +551,22 @@ class DownloadManager {
   private async run(task: TaskInternal): Promise<void> {
     let sink: BufferSink | null = null;
     try {
-      // Đệm vào OPFS (không hỏi thư mục, không tốn RAM); trình duyệt không hỗ
-      // trợ thì dồn vào bộ nhớ.
-      const mime = task.fileName.toLowerCase().endsWith(".ts") ? "video/mp2t" : "video/mp4";
-      sink = (await createOpfsSink()) ?? createMemorySink(mime);
+      sink = (await createOpfsSink()) ?? createMemorySink();
       await this.downloadInto(task, (bytes) => sink!.append(bytes));
 
-      const finished = await sink.finish();
+      const isTs = task.fileName.toLowerCase().endsWith(".ts");
+      const finished = await sink.finish(isTs ? "video/mp2t" : "video/mp4");
       task.status = "done";
       task.message = "Đã đưa vào mục Tải xuống";
       task.speedBps = 0;
       this.emit();
 
       if (finished.opfsName && (await ensureDownloadSw())) {
-        // SW stream file từ OPFS kèm Content-Length: trình duyệt hiển thị đúng
-        // dung lượng và chép vào Downloads gần như ngay lập tức.
         const saveUrl = `/sw-download/save?name=${encodeURIComponent(finished.opfsName)}&as=${encodeURIComponent(task.fileName)}`;
         triggerBrowserSaveUrl(task.fileName, saveUrl);
       } else if (finished.size <= MEMORY_BLOB_LIMIT) {
-        // Chromium treo khi tải blob tạo từ File trên OPFS — chép sang Blob bộ
-        // nhớ (có giới hạn kích thước) để lệnh tải chạy ngay.
         const buffer = await finished.blob.arrayBuffer();
-        triggerBrowserSave(task.fileName, new Blob([buffer], { type: mime }));
+        triggerBrowserSave(task.fileName, new Blob([buffer], { type: isTs ? "video/mp2t" : "video/mp4" }));
       } else {
         triggerBrowserSave(task.fileName, finished.blob);
       }
@@ -500,7 +590,9 @@ class DownloadManager {
   ): Promise<void> {
     const { res, finalUrl } = await this.fetchProxied(task.sourceUrl, task);
     if (!res.ok) {
-      throw new Error(`Không lấy được dữ liệu video (HTTP ${res.status})`);
+      throw new Error(
+        `Không lấy được dữ liệu video (HTTP ${res.status}) — link có thể đã hết hạn hoặc bị chặn theo vùng`,
+      );
     }
     const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
     const hintsPlaylist =
@@ -596,6 +688,10 @@ class DownloadManager {
     task.doneUnits = task.totalUnits;
   }
 
+  // -------------------------------------------------------------------------
+  // HLS
+  // -------------------------------------------------------------------------
+
   private async downloadHls(
     task: TaskInternal,
     baseUrl: string,
@@ -612,45 +708,141 @@ class DownloadManager {
       return;
     }
 
-    const { segments, keyInfo, mediaSequence } = parseMediaPlaylist(playlist, baseUrl);
-    if (segments.length === 0) throw new Error("Không tìm thấy phân đoạn video");
+    const parsed = parseMediaPlaylist(playlist, baseUrl);
+    if (parsed.segments.length === 0) throw new Error("Không tìm thấy phân đoạn video");
 
-    task.totalUnits = segments.length;
-    task.message = "Đang tải…";
-    this.emit();
-
-    let keyBytes: ArrayBuffer | null = null;
-    if (keyInfo) {
-      const { res: keyResponse } = await this.fetchProxied(keyInfo.uri, task);
-      if (!keyResponse.ok) throw new Error("Không tải được khóa giải mã");
-      keyBytes = await keyResponse.arrayBuffer();
+    // Đặt đuôi file theo định dạng thật: fMP4 có init segment → .mp4; MPEG-TS → .ts
+    // (lưu TS dưới tên .mp4 khiến nhiều trình phát hiểu nhầm container).
+    const wantedExt = parsed.hasMap ? ".mp4" : ".ts";
+    if (!task.fileName.toLowerCase().endsWith(wantedExt)) {
+      const base = task.fileName.replace(/\.(ts|mp4|m4v|mkv|webm)$/i, "");
+      task.fileName = `${base}${wantedExt}`;
     }
 
-    let nextIndex = 0;
-    const worker = async (): Promise<void> => {
-      for (;;) {
-        if (task.abort.signal.aborted) throw new DOMException("Aborted", "AbortError");
-        const index = nextIndex;
-        nextIndex += 1;
-        if (index >= segments.length) return;
-        const segment = segments[index];
-        const { res: response } = await this.fetchProxied(segment.url, task);
-        if (!response.ok) {
-          throw new Error(`Lỗi tải phân đoạn ${index + 1} (HTTP ${response.status})`);
-        }
-        let data = await response.arrayBuffer();
-        if (keyBytes && keyInfo) {
-          data = await decryptAes128(data, keyBytes, ivFor(keyInfo, mediaSequence + index));
-        }
-        await append(new Uint8Array(data));
-        task.loadedBytes += data.byteLength;
-        task.doneUnits = index + 1;
+    task.totalUnits = parsed.segments.length;
+    task.message =
+      parsed.totalDuration > 0
+        ? `Đang tải ${parsed.segments.length} phân đoạn (${formatDuration(parsed.totalDuration)})…`
+        : `Đang tải ${parsed.segments.length} phân đoạn…`;
+    if (!parsed.isEndList) {
+      task.message += " — playlist không có điểm kết thúc, có thể thiếu phần cuối";
+    }
+    this.emit();
+
+    const keyCache = new Map<string, ArrayBuffer>();
+    const mapCache = new Map<string, Uint8Array>();
+
+    // Tải song song CONCURRENCY phân đoạn nhưng ghi vào file theo đúng thứ tự playlist.
+    const slots: Promise<Uint8Array>[] = new Array<Promise<Uint8Array>>(parsed.segments.length);
+    const startFetch = (index: number): void => {
+      const promise = this.fetchSegment(
+        task,
+        parsed.segments[index],
+        parsed.mediaSequence + index,
+        keyCache,
+        `${index + 1}/${parsed.segments.length}`,
+      );
+      slots[index] = promise;
+      promise.catch(() => undefined); // tránh cảnh báo rejection trước khi await theo thứ tự
+    };
+    for (let i = 0; i < Math.min(CONCURRENCY, parsed.segments.length); i += 1) startFetch(i);
+
+    const writtenMaps = new Set<string>();
+    let lastEmit = 0;
+    for (let i = 0; i < parsed.segments.length; i += 1) {
+      const data = await slots[i];
+      if (i + CONCURRENCY < parsed.segments.length) startFetch(i + CONCURRENCY);
+
+      const segment = parsed.segments[i];
+      if (segment.map && !writtenMaps.has(segment.map.url)) {
+        writtenMaps.add(segment.map.url);
+        await append(await this.fetchMap(task, segment.map, mapCache));
+      }
+
+      await append(data);
+      task.loadedBytes += data.length;
+      task.doneUnits = i + 1;
+      const now = performance.now();
+      if (now - lastEmit > 250) {
         this.updateSpeed(task);
+        lastEmit = now;
         this.emit();
       }
-    };
+    }
+    this.updateSpeed(task);
+    this.emit();
+  }
 
-    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, segments.length) }, () => worker()));
+  /** Tải 1 phân đoạn, giải mã AES-128 nếu cần, kiểm tra dữ liệu và thử lại khi lỗi. */
+  private async fetchSegment(
+    task: TaskInternal,
+    segment: SegmentMeta,
+    sequence: number,
+    keyCache: Map<string, ArrayBuffer>,
+    label: string,
+  ): Promise<Uint8Array> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < SEGMENT_ATTEMPTS; attempt += 1) {
+      if (task.abort.signal.aborted) throw new DOMException("Aborted", "AbortError");
+      try {
+        const { res } = await this.fetchProxied(segment.url, task, segment.byteRange);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        let data = new Uint8Array(await res.arrayBuffer());
+        if (segment.key?.uri) {
+          let keyBytes = keyCache.get(segment.key.uri);
+          if (!keyBytes) {
+            const { res: keyResponse } = await this.fetchProxied(segment.key.uri, task);
+            if (!keyResponse.ok) throw new Error(`Không tải được khóa giải mã (HTTP ${keyResponse.status})`);
+            keyBytes = await keyResponse.arrayBuffer();
+            keyCache.set(segment.key.uri, keyBytes);
+          }
+          const plain = await decryptAes128(data.buffer, keyBytes, ivFor(segment.key.ivHex, sequence));
+          data = new Uint8Array(plain);
+        }
+        this.validateSegment(data, segment);
+        return data;
+      } catch (error) {
+        lastError = error;
+        if (attempt < SEGMENT_ATTEMPTS - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+        }
+      }
+    }
+    throw new Error(
+      `Phân đoạn ${label} không hợp lệ (${lastError instanceof Error ? lastError.message : "lỗi không xác định"}) — máy chủ có thể đang chặn hoặc link hết hạn`,
+    );
+  }
+
+  /** Kiểm tra dữ liệu phân đoạn: TS phải có sync byte 0x47, MP4 phải có box hợp lệ. */
+  private validateSegment(data: Uint8Array, segment: SegmentMeta): void {
+    if (data.length < 8) {
+      throw new Error("phân đoạn quá ngắn");
+    }
+    // Byterange lệch packet → không kiểm tra sync byte.
+    if (segment.byteRange && segment.byteRange.offset % 188 !== 0) return;
+    const isTs = data[0] === 0x47 && (data.length < 188 || data[188] === 0x47);
+    if (isTs) return;
+    const boxType = new TextDecoder("ascii").decode(data.subarray(4, 8));
+    const knownMp4Boxes = new Set([
+      "ftyp", "moof", "styp", "mdat", "moov", "sidx", "free", "skip", "emsg", "prft",
+    ]);
+    if (knownMp4Boxes.has(boxType)) return;
+    throw new Error("dữ liệu không phải video (máy chủ trả trang lỗi/không hợp lệ)");
+  }
+
+  private async fetchMap(
+    task: TaskInternal,
+    map: NonNullable<SegmentMeta["map"]>,
+    mapCache: Map<string, Uint8Array>,
+  ): Promise<Uint8Array> {
+    const cacheKey = `${map.url}|${map.byteRange ? `${map.byteRange.offset}-${map.byteRange.length}` : ""}`;
+    const cached = mapCache.get(cacheKey);
+    if (cached) return cached;
+    const { res } = await this.fetchProxied(map.url, task, map.byteRange);
+    if (!res.ok) throw new Error(`Không tải được init segment (HTTP ${res.status})`);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    mapCache.set(cacheKey, bytes);
+    return bytes;
   }
 }
 
