@@ -412,9 +412,42 @@ function extractNguoncStreamUrl(html: string, baseUrl: string): string | null {
     }
   }
 
+  // Embed dạng iframe player: https://player.<domain>/player/?url=<base64 m3u8>
+  // (KK và nhiều trang khác nhúng luồng kiểu này).
+  const playerParam = html.match(/\/player\/\?url=([^&"']+)/)?.[1];
+  if (playerParam) {
+    const normalized = playerParam.includes("%")
+      ? (() => {
+          try {
+            return decodeURIComponent(playerParam);
+          } catch {
+            return playerParam;
+          }
+        })()
+      : playerParam;
+    const decoded = decodeBase64UrlText(normalized);
+    if (decoded) return decoded;
+  }
+
   const scriptTag = html.match(/(?<=<script.*?src=".*?url=)[^&"]*?\.m3u8[^&"]*/)?.[0];
   if (scriptTag) return toAbs(decodeURIComponent(scriptTag));
 
+  return null;
+}
+
+/** Thử giải mã chuỗi base64/base64url thành URL http(s). */
+function decodeBase64UrlText(value: string): string | null {
+  const candidates = [value, value.replace(/-/g, "+").replace(/_/g, "/")];
+  for (const candidate of candidates) {
+    const padded = candidate + "=".repeat((4 - (candidate.length % 4)) % 4);
+    try {
+      const binary = atob(padded);
+      const text = new TextDecoder().decode(Uint8Array.from(binary, (c) => c.charCodeAt(0)));
+      if (/^https?:\/\//i.test(text)) return text;
+    } catch {
+      // thử biến thể tiếp theo
+    }
+  }
   return null;
 }
 

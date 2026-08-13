@@ -183,9 +183,11 @@ export default function PhimDetail() {
     setPlayRequested(false);
   }, [embedKey]);
 
+  // SV NC thường chỉ trả link nhúng (embed) chứ không có m3u8 trực tiếp —
+  // trình tải biết tự dò luồng video trong trang nhúng nên vẫn tải được.
+  const dlUrl = currentEp?.m3u8 || currentEp?.embed || "";
+
   useEffect(() => {
-    if (!data || !currentEp) return;
-    saveWatchMemory("hub", slug, { server, ep, from: activeSource });
   }, [data, currentEp, slug, server, ep, activeSource]);
 
   const scrollPlayerIntoView = useCallback((): void => {
@@ -351,9 +353,15 @@ export default function PhimDetail() {
             })}
             <button
               type="button"
-              disabled={!currentEp?.m3u8}
-              onClick={() => currentEp?.m3u8 && startDownload(currentEp.name || `Tập ${ep + 1}`, currentEp.m3u8)}
-              title={currentEp?.m3u8 ? "Tải tập đang xem về máy" : "Tập này chỉ có link nhúng, không hỗ trợ tải"}
+              disabled={!dlUrl}
+              onClick={() => dlUrl && startDownload(currentEp.name || `Tập ${ep + 1}`, dlUrl)}
+              title={
+                dlUrl
+                  ? currentEp?.m3u8
+                    ? "Tải tập đang xem về máy"
+                    : "Tập này chỉ có link nhúng — trình tải sẽ tự dò luồng video"
+                  : "Tập này không có link tải"
+              }
               className="ml-auto inline-flex items-center gap-2 rounded-full bg-gradient-to-r from-emerald-500 to-sky-500 px-5 py-2 text-sm font-semibold text-white shadow-md transition hover:shadow-lg hover:brightness-110 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none disabled:hover:brightness-100"
             >
               <Download size={16} aria-hidden="true" />
@@ -399,9 +407,9 @@ export default function PhimDetail() {
                     >
                       {e.name}
                     </button>
-                    {e.m3u8 && (
+                    {(e.m3u8 || e.embed) && (
                       <button
-                        onClick={() => startDownload(e.name || `Tập ${i + 1}`, e.m3u8)}
+                        onClick={() => startDownload(e.name || `Tập ${i + 1}`, e.m3u8 || e.embed)}
                         aria-label={`Tải ${e.name}`}
                         title={`Tải ${e.name}`}
                         className="px-1.5 opacity-70 transition hover:opacity-100"
