@@ -8,6 +8,12 @@
 //  - Phát hiện phần mở đầu giống trailer/intro (đoạn ngắn tách bởi discontinuity)
 //    và bỏ qua khi ghép file — ghép lẫn codec/độ phân giải khiến trình phát dừng
 //    sau vài chục giây.
+//  - Dò codec (H.264/HEVC…), chữ ký SPS và PTS của từng phân đoạn TS để nhận ra
+//    các khối được mã hóa bởi các encoder khác nhau (trailer ghép trước tập phim,
+//    đoạn convertv8 thay thế…). Đoạn mở đầu khác luồng mã hóa bị bỏ qua; khi toàn
+//    bộ phần giữ lại là H.264 + AAC, file được đóng gói lại thành MP4 chuẩn với
+//    dòng thời gian liền mạch (remux qua mux.js) — khắc phục lỗi "tải về chỉ xem
+//    được vài chục giây" do ghép thô TS nhiều luồng khác nhau.
 //  - Kiểm tra dữ liệu từng phân đoạn (sync byte TS / box MP4) và thử lại tối đa 3
 //    lần — bắt lỗi máy chủ trả trang lỗi HTML thay vì video (file "đủ dung lượng
 //    nhưng chỉ xem được vài giây").
@@ -15,6 +21,9 @@
 //    Hỗ trợ #EXT-X-BYTERANGE (Range request) và xoay khóa AES-128 giữa playlist.
 //  - Dữ liệu đệm vào OPFS; khi xong, service worker stream file kèm Content-Length
 //    để trình duyệt hiện đúng dung lượng và chép vào mục Tải xuống ngay.
+
+import { describeProbe, probeTsSegment, type TsProbe } from "./ts-probe";
+import { TsRemuxer } from "./ts-remux";
 
 export type DownloadStatus = "queued" | "active" | "done" | "error" | "cancelled";
 
@@ -799,9 +808,117 @@ class DownloadManager {
     const kept = parsed.segments.slice(skipCount);
     const keptDuration = parsed.totalDuration - skippedDuration;
 
-    // Đặt đuôi file theo định dạng thật của phần GIỮ LẠI: fMP4 có init segment → .mp4;
-    // MPEG-TS → .ts (lưu TS dưới tên .mp4 khiến nhiều trình phát hiểu nhầm container).
-    const wantedExt = kept.some((segment) => segment.map !== undefined) ? ".mp4" : ".ts";
+    // ---- Dò codec từng phân đoạn để nhận ra các khối mã hóa khác nhau ----
+    // (trailer ghép trước tập phim, đoạn convertv8…). Khi toàn bộ phần giữ lại
+    // là H.264 + AAC, đóng gói lại MP4 với dòng thời gian liền mạch thay vì ghép
+    // thô TS — ghép thô nhiều luồng khác nhau khiến trình phát chỉ xem được
+    // một phần file.
+    const PROBE_BYTES = 512 * 1024;
+    const probes: (TsProbe | null)[] = new Array<TsProbe | null>(kept.length).fill(null);
+    const probeable =
+      kept.length >= 2 &&
+      !parsed.hasMap &&
+      kept.every((segment) => !segment.key?.uri && !segment.byteRange);
+    if (probeable) {
+      task.message = "Đang phân tích định dạng luồng…";
+      this.emit();
+      let nextProbe = 0;
+      const probeWorker = async (): Promise<void> => {
+        for (;;) {
+          if (task.abort.signal.aborted) throw new DOMException("Aborted", "AbortError");
+          const index = nextProbe;
+          if (index >= kept.length) return;
+          nextProbe += 1;
+          try {
+            const { res } = await this.fetchProxied(kept[index].url, task, {
+              offset: 0,
+              length: PROBE_BYTES,
+            });
+            if (!res.ok) continue;
+            const bytes = new Uint8Array(await res.arrayBuffer());
+            if (bytes.length < 188 * 2 || bytes[0] !== 0x47) continue;
+            const probe = probeTsSegment(bytes);
+            if (probe) probes[index] = probe;
+          } catch {
+            // Không dò được phân đoạn này — sẽ tắt đường đóng gói MP4 bên dưới.
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: 4 }, () => probeWorker()));
+    }
+
+    // Gom các phân đoạn liên tiếp cùng "profile" (codec + chữ ký SPS + codec âm thanh)
+    // thành các khối. Khối mở đầu khác profile với phần còn lại thường là trailer/intro.
+    type Run = {
+      key: string;
+      known: boolean;
+      startIndex: number;
+      endIndex: number;
+      count: number;
+      duration: number;
+    };
+    const runs: Run[] = [];
+    for (let i = 0; i < kept.length; i += 1) {
+      const probe = probes[i];
+      const last = runs[runs.length - 1];
+      const key = probe?.profileKey ?? (last && !last.known ? last.key : `?${i}`);
+      if (last && last.key === key) {
+        last.endIndex = i + 1;
+        last.count += 1;
+        last.duration += kept[i].duration;
+      } else {
+        runs.push({
+          key,
+          known: probe !== null,
+          startIndex: i,
+          endIndex: i + 1,
+          count: 1,
+          duration: kept[i].duration,
+        });
+      }
+    }
+
+    let profileSkipCount = 0;
+    let profileSkippedDuration = 0;
+    if (runs.length > 1) {
+      let dominant = runs[0];
+      for (const run of runs) if (run.duration > dominant.duration) dominant = run;
+      const first = runs[0];
+      if (
+        first !== dominant &&
+        first.known &&
+        dominant.known &&
+        dominant.duration > 0 &&
+        first.duration <= 180 &&
+        dominant.duration >= first.duration * 3
+      ) {
+        profileSkipCount = first.endIndex;
+        profileSkippedDuration = first.duration;
+      }
+    }
+
+    const finalKept = kept.slice(profileSkipCount);
+    const finalProbes = probes.slice(profileSkipCount);
+    const finalDuration = keptDuration - profileSkippedDuration;
+
+    // Chỉ đóng gói lại MP4 khi toàn bộ phần giữ lại cùng một luồng H.264 + AAC
+    // (mux.js không hỗ trợ HEVC/MP3). Các trường hợp khác giữ nguyên cách ghép TS.
+    const canRemux =
+      finalKept.length >= 2 &&
+      finalProbes.every((probe) => probe !== null) &&
+      new Set(finalProbes.map((probe) => (probe as TsProbe).profileKey)).size === 1 &&
+      finalProbes.every(
+        (probe) =>
+          (probe as TsProbe).videoCodec === "avc" &&
+          (probe as TsProbe).videoPts !== null &&
+          ((probe as TsProbe).audioCodec === "aac" || (probe as TsProbe).audioCodec === null),
+      );
+
+    // Đặt đuôi file theo định dạng thật của phần GIỮ LẠI: đóng gói MP4 hoặc fMP4
+    // có init segment → .mp4; MPEG-TS → .ts (lưu TS dưới tên .mp4 khiến nhiều trình
+    // phát hiểu nhầm container).
+    const wantedExt =
+      canRemux || finalKept.some((segment) => segment.map !== undefined) ? ".mp4" : ".ts";
     if (!task.fileName.toLowerCase().endsWith(wantedExt)) {
       const base = task.fileName.replace(/\.(ts|mp4|m4v|mkv|webm)$/i, "");
       task.fileName = `${base}${wantedExt}`;
@@ -810,7 +927,18 @@ class DownloadManager {
     const summaryParts: string[] = [
       `${parsed.segments.length} phân đoạn · tổng ${formatDuration(parsed.totalDuration)}`,
     ];
+    const sampleProbe = probes.find((probe) => probe !== null) ?? null;
+    if (sampleProbe) summaryParts.push(describeProbe(sampleProbe));
     if (skipCount > 0) summaryParts.push(`bỏ qua ${skipCount} đoạn mở đầu (${formatDuration(skippedDuration)})`);
+    if (profileSkipCount > 0) {
+      summaryParts.push(
+        `bỏ qua ${profileSkipCount} đoạn khác luồng mã hóa (${formatDuration(profileSkippedDuration)})`,
+      );
+    }
+    if (canRemux) summaryParts.push("đã đóng gói lại MP4 chuẩn — dòng thời gian liền mạch");
+    else if (runs.length > 1) {
+      summaryParts.push("trộn nhiều luồng mã hóa — giữ TS, mở bằng VLC nếu trình duyệt dừng giữa chừng");
+    }
     if (parsed.discontinuities.length > 0) summaryParts.push(`${parsed.discontinuities.length} discontinuity`);
     if (!parsed.isEndList) summaryParts.push("thiếu ENDLIST");
     if (
@@ -824,13 +952,17 @@ class DownloadManager {
     }
     task.playlistSummary = `Playlist: ${summaryParts.join(" · ")}`;
 
-    task.totalUnits = kept.length;
-    task.message =
-      keptDuration > 0
-        ? `Đang tải ${kept.length} phân đoạn (${formatDuration(keptDuration)})…`
-        : `Đang tải ${kept.length} phân đoạn…`;
+    task.totalUnits = finalKept.length;
+    task.message = canRemux
+      ? `Đang tải ${finalKept.length} phân đoạn và đóng gói MP4…`
+      : finalDuration > 0
+        ? `Đang tải ${finalKept.length} phân đoạn (${formatDuration(finalDuration)})…`
+        : `Đang tải ${finalKept.length} phân đoạn…`;
     if (skipCount > 0) {
       task.message += ` — đã bỏ qua phần mở đầu ${formatDuration(skippedDuration)} (trailer/intro)`;
+    }
+    if (profileSkipCount > 0) {
+      task.message += ` — đã bỏ qua ${profileSkipCount} đoạn mở đầu khác luồng mã hóa`;
     }
     if (!parsed.isEndList) {
       task.message += " — playlist không có điểm kết thúc, có thể thiếu phần cuối";
@@ -839,11 +971,12 @@ class DownloadManager {
 
     const keyCache = new Map<string, ArrayBuffer>();
     const mapCache = new Map<string, Uint8Array>();
+    const remuxer = canRemux ? new TsRemuxer() : null;
 
     // Tải song song CONCURRENCY phân đoạn nhưng ghi vào file theo đúng thứ tự playlist.
-    const slots: Promise<Uint8Array>[] = new Array<Promise<Uint8Array>>(kept.length);
-    const startFetch = (keptIndex: number): void => {
-      const originalIndex = skipCount + keptIndex;
+    const slots: Promise<Uint8Array>[] = new Array<Promise<Uint8Array>>(finalKept.length);
+    const startFetch = (finalIndex: number): void => {
+      const originalIndex = skipCount + profileSkipCount + finalIndex;
       const promise = this.fetchSegment(
         task,
         parsed.segments[originalIndex],
@@ -851,25 +984,42 @@ class DownloadManager {
         keyCache,
         `${originalIndex + 1}/${parsed.segments.length}`,
       );
-      slots[keptIndex] = promise;
+      slots[finalIndex] = promise;
       promise.catch(() => undefined); // tránh cảnh báo rejection trước khi await theo thứ tự
     };
-    for (let i = 0; i < Math.min(CONCURRENCY, kept.length); i += 1) startFetch(i);
+    for (let i = 0; i < Math.min(CONCURRENCY, finalKept.length); i += 1) startFetch(i);
 
     const writtenMaps = new Set<string>();
     let lastEmit = 0;
-    for (let i = 0; i < kept.length; i += 1) {
+    let expectedStart = 0;
+    for (let i = 0; i < finalKept.length; i += 1) {
       const data = await slots[i];
-      if (i + CONCURRENCY < kept.length) startFetch(i + CONCURRENCY);
+      if (i + CONCURRENCY < finalKept.length) startFetch(i + CONCURRENCY);
 
-      const segment = kept[i];
+      const segment = finalKept[i];
       if (segment.map && !writtenMaps.has(segment.map.url)) {
         writtenMaps.add(segment.map.url);
         await append(await this.fetchMap(task, segment.map, mapCache));
       }
 
-      await append(data);
-      task.loadedBytes += data.length;
+      if (remuxer) {
+        const probe = finalProbes[i] as TsProbe;
+        const ptsSeconds = (probe.videoPts as number) / 90000;
+        const result = await remuxer.push(data, ptsSeconds, expectedStart);
+        if (result.chunks.length === 0) {
+          throw new Error(
+            `Không thể đóng gói phân đoạn ${i + 1} (luồng không chuẩn) — hãy thử lại`,
+          );
+        }
+        for (const chunk of result.chunks) {
+          await append(chunk);
+          task.loadedBytes += chunk.length;
+        }
+        expectedStart = result.placedAt + segment.duration;
+      } else {
+        await append(data);
+        task.loadedBytes += data.length;
+      }
       task.doneUnits = i + 1;
       const now = performance.now();
       if (now - lastEmit > 250) {
