@@ -11,6 +11,7 @@ import {
   type HubItem,
   type HubSource,
 } from "@/lib/hub";
+import { Logo } from "@/components/Logo";
 import {
   readListPosition,
   readListState,
@@ -183,9 +184,9 @@ export default function PhimTongHop() {
   return (
     <div className="mx-auto max-w-7xl px-4 py-6">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <div>
+        <div className="flex items-center gap-3">
+          <Logo size={40} />
           <h1 className="text-2xl font-bold">Phim Tổng hợp</h1>
-          <p className="text-xs text-muted-foreground">Một danh sách chung từ NC và KK</p>
         </div>
         <form
           onSubmit={(e) => {

@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Download, Share2, X } from "lucide-react";
 
 import DownloadPanel from "@/components/DownloadPanel";
+import { Logo } from "@/components/Logo";
 import { HeroStage } from "@/components/detail/HeroStage";
 import { MovieInfo } from "@/components/detail/MovieInfo";
 import { RelatedMovies } from "@/components/detail/RelatedMovies";
@@ -308,8 +309,9 @@ export default function PhimDetail() {
             e.preventDefault();
             navigate(backHref);
           }}
-          className="text-sm text-muted-foreground hover:underline"
+          className="flex items-center gap-2 text-sm text-muted-foreground hover:underline"
         >
+          <Logo size={24} />
           ← Về danh sách
         </Link>
         {data && (
