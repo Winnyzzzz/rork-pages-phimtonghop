@@ -238,16 +238,6 @@ export default function PhimDetail() {
         <div className="flex items-center gap-2">
           <button
             type="button"
-            disabled={!currentEp?.m3u8}
-            onClick={() => currentEp?.m3u8 && startDownload(currentEp.name || `Tập ${ep + 1}`, currentEp.m3u8)}
-            title={currentEp?.m3u8 ? "Tải tập đang xem về máy" : "Tập này chỉ có link nhúng, không hỗ trợ tải"}
-            className="inline-flex min-h-10 items-center gap-1.5 rounded-md border bg-background px-3 text-sm font-medium transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <Download size={14} aria-hidden="true" />
-            Tải xuống
-          </button>
-          <button
-            type="button"
             onClick={() => void shareCurrentUrl()}
             className="inline-flex min-h-10 items-center gap-1.5 rounded-md border bg-background px-3 text-sm font-medium transition hover:bg-muted"
           >
@@ -309,6 +299,16 @@ export default function PhimDetail() {
                 </button>
               );
             })}
+            <button
+              type="button"
+              disabled={!currentEp?.m3u8}
+              onClick={() => currentEp?.m3u8 && startDownload(currentEp.name || `Tập ${ep + 1}`, currentEp.m3u8)}
+              title={currentEp?.m3u8 ? "Tải tập đang xem về máy" : "Tập này chỉ có link nhúng, không hỗ trợ tải"}
+              className="ml-auto inline-flex items-center gap-2 rounded-full bg-gradient-to-r from-emerald-500 to-sky-500 px-5 py-2 text-sm font-semibold text-white shadow-md transition hover:shadow-lg hover:brightness-110 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none disabled:hover:brightness-100"
+            >
+              <Download size={16} aria-hidden="true" />
+              Tải xuống
+            </button>
           </div>
 
           {isLoadingAlternates && (
