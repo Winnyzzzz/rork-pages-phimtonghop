@@ -1,9 +1,12 @@
 // Trình tải video (m3u8 HLS / link trực tiếp):
-//  - Ưu tiên tải qua proxy /download/* để tránh lỗi CORS/redirect;
-//    nếu proxy không có (preview), tự chuyển sang tải trực tiếp.
-//  - Trên Chromium (Cốc Cốc, Chrome, Edge…) dùng File System Access API để ghi
-//    thẳng ra đĩa khi xong — không qua trình quản lý tải của trình duyệt.
-//  - Trình duyệt khác: ghép vào Blob rồi kích hoạt lưu qua thẻ <a download>.
+//  - Ưu tiên tải qua proxy /download/* để tránh lỗi CORS/redirect; proxy thử nhiều
+//    kiểu Referer (NguonC kiểm tra khắt khe) và trả về URL cuối cùng sau redirect
+//    để client resolve đúng đường dẫn phân đoạn.
+//  - Dữ liệu được đệm vào OPFS (đĩa ảo của origin, không tốn RAM). Khi xong, một
+//    service worker nhỏ stream file từ OPFS kèm Content-Length — trình duyệt hiện
+//    đúng dung lượng và chép vào mục Tải xuống gần như ngay lập tức.
+//  - Không có SW/OPFS: file nhỏ chép sang Blob bộ nhớ rồi lưu; trình duyệt cũ
+//    dồn vào bộ nhớ từ đầu.
 
 export type DownloadStatus = "queued" | "active" | "done" | "error" | "cancelled";
 
@@ -28,9 +31,19 @@ type TaskInternal = DownloadTask & {
 
 type KeyInfo = { uri: string; ivHex?: string };
 type Segment = { url: string };
+type ProxiedResponse = { res: Response; finalUrl: string };
+type FinishedBuffer = { blob: Blob; opfsName: string | null; size: number };
+type BufferSink = {
+  append: (bytes: Uint8Array) => Promise<void>;
+  finish: () => Promise<FinishedBuffer>;
+  abort: () => Promise<void>;
+};
 
 const DL_KEY = "phim-tl-2026";
 const CONCURRENCY = 3;
+const MEMORY_BLOB_LIMIT = 512 * 1024 * 1024;
+const RESOLVE_MAX_DEPTH = 3;
+const OPFS_DIR = "video-downloads";
 
 function toBase64Url(value: string): string {
   const bytes = new TextEncoder().encode(value);
@@ -47,6 +60,26 @@ function uuid(): string {
   return typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()
     : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+/** Chuẩn hóa URL nguồn: URL dạng //host/... (protocol-relative) thành https. */
+function normalizeSourceUrl(url: string): string {
+  const trimmed = url.trim();
+  if (trimmed.startsWith("//")) return `https:${trimmed}`;
+  return trimmed;
+}
+
+/** Referer của trang nguồn để gửi kèm qua proxy — một số CDN kiểm tra theo domain. */
+function siteRefererFor(url: string): string {
+  let host = "";
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+  if (host.includes("nguonc")) return "https://phim.nguonc.com/";
+  if (host.includes("phimapi") || host.includes("kkphim")) return "https://phimapi.com/";
+  return "";
 }
 
 export function sanitizeFileName(name: string): string {
@@ -83,16 +116,25 @@ function parseAttrs(source: string): Record<string, string> {
 function pickBestVariant(text: string, baseUrl: string): string {
   const lines = text.split(/\r?\n/);
   let bestUrl: string | null = null;
-  let bestBandwidth = -1;
+  let bestScore = -1;
+  const resolutionScore = (resolution?: string): number => {
+    if (!resolution) return 0;
+    const [w, h] = resolution.toLowerCase().split("x");
+    return (parseInt(w, 10) || 0) * (parseInt(h, 10) || 0);
+  };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line.startsWith("#EXT-X-STREAM-INF")) continue;
     const attrs = parseAttrs(line.slice(18));
-    const bandwidth = parseInt(attrs.BANDWIDTH ?? "0", 10) || 0;
     const next = lines[i + 1]?.trim() ?? "";
-    if (next && !next.startsWith("#") && bandwidth > bestBandwidth) {
-      bestBandwidth = bandwidth;
-      bestUrl = new URL(next, baseUrl).href;
+    if (!next || next.startsWith("#")) continue;
+    const url = new URL(next, baseUrl).href;
+    // Ưu tiên BANDWIDTH; playlist thiếu BANDWIDTH thì dùng độ phân giải; thiếu nữa thì luồng đầu tiên.
+    const bandwidth = parseInt(attrs.BANDWIDTH ?? "0", 10) || 0;
+    const score = bandwidth > 0 ? bandwidth * 10_000 + resolutionScore(attrs.RESOLUTION) : resolutionScore(attrs.RESOLUTION);
+    if (score > bestScore) {
+      bestScore = score;
+      bestUrl = url;
     }
   }
   if (!bestUrl) throw new Error("Playlist không có luồng video");
@@ -115,6 +157,8 @@ function parseMediaPlaylist(
       const attrs = parseAttrs(line.slice(11));
       if (attrs.METHOD === "AES-128" && attrs.URI) {
         keyInfo = { uri: new URL(attrs.URI, baseUrl).href, ivHex: attrs.IV };
+      } else if (attrs.METHOD && attrs.METHOD !== "NONE") {
+        throw new Error(`Luồng dùng mã hóa không hỗ trợ (${attrs.METHOD})`);
       }
     } else if (line && !line.startsWith("#")) {
       segments.push({ url: new URL(line, baseUrl).href });
@@ -149,23 +193,61 @@ function triggerBrowserSave(fileName: string, blob: Blob): void {
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  // Giữ object URL đủ lâu để trình duyệt sao chép xong file lớn (OPFS → Downloads).
+  // Giữ object URL đủ lâu để trình duyệt sao chép xong file lớn.
   setTimeout(() => URL.revokeObjectURL(url), 600_000);
 }
 
-// Nơi chứa dữ liệu trong lúc tải: OPFS (đĩa ảo của origin, không tốn RAM)
-// hoặc bộ nhớ nếu trình duyệt không hỗ trợ OPFS.
-type BufferSink = {
-  append: (bytes: Uint8Array) => Promise<void>;
-  finish: () => Promise<Blob>;
-  abort: () => Promise<void>;
-};
+function triggerBrowserSaveUrl(fileName: string, href: string): void {
+  const anchor = document.createElement("a");
+  anchor.href = href;
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+}
+
+// ---------------------------------------------------------------------------
+// Service worker /sw-download: stream file đã tải xong từ OPFS kèm
+// Content-Length. Chromium treo (hiện 0.0B) khi tải blob tạo trực tiếp từ
+// File trên OPFS, còn luồng HTTP có Content-Length thì hiển thị và chép bình thường.
+// ---------------------------------------------------------------------------
+
+let swProbe: Promise<boolean> | null = null;
+
+function ensureDownloadSw(): Promise<boolean> {
+  if (swProbe) return swProbe;
+  swProbe = (async () => {
+    if (!("serviceWorker" in navigator)) return false;
+    try {
+      await navigator.serviceWorker.register("/sw-download/sw.js", { scope: "/sw-download/" });
+      const ready = await Promise.race([
+        navigator.serviceWorker.ready,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
+      ]);
+      if (!ready) return false;
+      // Kiểm tra SW đã thực sự kiểm soát trang bằng một yêu cầu ping.
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        try {
+          const res = await fetch("/sw-download/ping", { cache: "no-store" });
+          if (res.ok && (await res.text()) === "sw-ok") return true;
+        } catch {
+          // chưa kiểm soát — thử lại
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  })();
+  return swProbe;
+}
 
 async function createOpfsSink(): Promise<BufferSink | null> {
   try {
     const root = await navigator.storage.getDirectory();
-    const dir = await root.getDirectoryHandle("video-downloads", { create: true });
-    // Dọn các file tạm quá 1 giờ (đã được trình duyệt sao chép xong từ lần trước).
+    const dir = await root.getDirectoryHandle(OPFS_DIR, { create: true });
+    // Dọn file tạm quá 1 giờ (trình duyệt đã chép xong từ lần trước hoặc tải hỏng).
     for await (const [name] of dir.entries()) {
       const match = /^v-(\d+)-/.exec(name);
       if (match && Date.now() - Number(match[1]) > 3_600_000) {
@@ -181,8 +263,8 @@ async function createOpfsSink(): Promise<BufferSink | null> {
       },
       finish: async () => {
         await writer.close();
-        // File nằm trên đĩa; tạo Blob từ nó để trình duyệt stream vào Downloads.
-        return handle.getFile();
+        const file = await handle.getFile();
+        return { blob: file, opfsName: name, size: file.size };
       },
       abort: async () => {
         await writer.abort().catch(() => undefined);
@@ -200,9 +282,49 @@ function createMemorySink(mime: string): BufferSink {
     append: async (bytes: Uint8Array) => {
       chunks.push(bytes.buffer as ArrayBuffer);
     },
-    finish: async () => new Blob(chunks, { type: mime }),
+    finish: async () => {
+      const blob = new Blob(chunks, { type: mime });
+      return { blob, opfsName: null, size: blob.size };
+    },
     abort: async () => undefined,
   };
+}
+
+/**
+ * Một số nguồn (NguonC…) trả về trang HTML ẩn URL luồng thay vì playlist trực tiếp.
+ * Trích các dạng phổ biến: encryptedURL → conf.php?url=, streamURL/file:/url =, script src chứa .m3u8.
+ */
+function extractNguoncStreamUrl(html: string, baseUrl: string): string | null {
+  const toAbs = (candidate: string): string | null => {
+    if (!candidate) return null;
+    try {
+      return new URL(candidate, baseUrl).href;
+    } catch {
+      return null;
+    }
+  };
+
+  const encryptedUrl = html.match(/(?<=encryptedURL = ").*(?=";)/)?.[0];
+  if (encryptedUrl) {
+    const resolved = toAbs(`conf.php?url=${encodeURIComponent(encryptedUrl)}`);
+    if (resolved) return resolved;
+  }
+
+  const streamUrl = html.match(
+    /(?<=(?:streamURL =|url =|file:|streamUrl":|data-stream-url=)\s?").*(?="(?:;|,|}|>|\n))/,
+  )?.[0];
+  if (streamUrl) {
+    try {
+      return toAbs(JSON.parse(`"${streamUrl}"`));
+    } catch {
+      return toAbs(streamUrl);
+    }
+  }
+
+  const scriptTag = html.match(/(?<=<script.*?src=".*?url=)[^&"]*?\.m3u8[^&"]*/)?.[0];
+  if (scriptTag) return toAbs(decodeURIComponent(scriptTag));
+
+  return null;
 }
 
 class DownloadManager {
@@ -236,14 +358,15 @@ class DownloadManager {
 
   /** Thêm tác vụ tải. Trả về false nếu URL này đang chờ/tải. */
   add(label: string, sourceUrl: string, fileName: string): boolean {
+    const normalized = normalizeSourceUrl(sourceUrl);
     const duplicate = this.tasks.some(
-      (t) => t.sourceUrl === sourceUrl && (t.status === "queued" || t.status === "active"),
+      (t) => t.sourceUrl === normalized && (t.status === "queued" || t.status === "active"),
     );
     if (duplicate) return false;
     const task: TaskInternal = {
       id: uuid(),
       fileName,
-      sourceUrl,
+      sourceUrl: normalized,
       label,
       status: "queued",
       loadedBytes: 0,
@@ -301,16 +424,22 @@ class DownloadManager {
     }
   }
 
-  private async fetchProxied(url: string, task: TaskInternal): Promise<Response> {
+  private async fetchProxied(url: string, task: TaskInternal): Promise<ProxiedResponse> {
+    const headers: Record<string, string> = { "x-dl-key": DL_KEY };
+    const referer = siteRefererFor(url);
+    if (referer) headers["x-dl-referer"] = referer;
     const proxied = await fetch(proxyUrlFor(url), {
       signal: task.abort.signal,
-      headers: { "x-dl-key": DL_KEY },
+      headers,
     }).catch(() => null);
     if (proxied && proxied.ok) {
-      const contentType = proxied.headers.get("content-type") ?? "";
-      if (!contentType.includes("text/html")) return proxied;
+      const contentType = (proxied.headers.get("content-type") ?? "").toLowerCase();
+      if (!contentType.includes("text/html")) {
+        return { res: proxied, finalUrl: proxied.headers.get("x-final-url") || url };
+      }
     }
-    return fetch(url, { signal: task.abort.signal });
+    const direct = await fetch(url, { signal: task.abort.signal });
+    return { res: direct, finalUrl: direct.url || url };
   }
 
   private updateSpeed(task: TaskInternal): void {
@@ -326,20 +455,31 @@ class DownloadManager {
   private async run(task: TaskInternal): Promise<void> {
     let sink: BufferSink | null = null;
     try {
-      // Tải trước vào đĩa ảo OPFS (không hỏi thư mục, không tốn RAM);
-      // trình duyệt không hỗ trợ thì dồn vào bộ nhớ.
+      // Đệm vào OPFS (không hỏi thư mục, không tốn RAM); trình duyệt không hỗ
+      // trợ thì dồn vào bộ nhớ.
       const mime = task.fileName.toLowerCase().endsWith(".ts") ? "video/mp2t" : "video/mp4";
       sink = (await createOpfsSink()) ?? createMemorySink(mime);
       await this.downloadInto(task, (bytes) => sink!.append(bytes));
 
-      const blob = await sink.finish();
+      const finished = await sink.finish();
       task.status = "done";
       task.message = "Đã đưa vào mục Tải xuống";
       task.speedBps = 0;
       this.emit();
-      // Lệnh tải ảo: dữ liệu đã nằm sẵn trên máy nên trình duyệt chỉ cần
-      // sao chép vào thư mục Downloads — file 100MB hoàn tất gần như ngay lập tức.
-      triggerBrowserSave(task.fileName, blob);
+
+      if (finished.opfsName && (await ensureDownloadSw())) {
+        // SW stream file từ OPFS kèm Content-Length: trình duyệt hiển thị đúng
+        // dung lượng và chép vào Downloads gần như ngay lập tức.
+        const saveUrl = `/sw-download/save?name=${encodeURIComponent(finished.opfsName)}&as=${encodeURIComponent(task.fileName)}`;
+        triggerBrowserSaveUrl(task.fileName, saveUrl);
+      } else if (finished.size <= MEMORY_BLOB_LIMIT) {
+        // Chromium treo khi tải blob tạo từ File trên OPFS — chép sang Blob bộ
+        // nhớ (có giới hạn kích thước) để lệnh tải chạy ngay.
+        const buffer = await finished.blob.arrayBuffer();
+        triggerBrowserSave(task.fileName, new Blob([buffer], { type: mime }));
+      } else {
+        triggerBrowserSave(task.fileName, finished.blob);
+      }
     } catch (error) {
       if (task.abort.signal.aborted) {
         task.status = "cancelled";
@@ -356,27 +496,104 @@ class DownloadManager {
   private async downloadInto(
     task: TaskInternal,
     append: (bytes: Uint8Array) => Promise<void>,
+    depth = 0,
   ): Promise<void> {
-    const response = await this.fetchProxied(task.sourceUrl, task);
-    if (!response.ok) {
-      throw new Error(`Không lấy được dữ liệu video (HTTP ${response.status})`);
+    const { res, finalUrl } = await this.fetchProxied(task.sourceUrl, task);
+    if (!res.ok) {
+      throw new Error(`Không lấy được dữ liệu video (HTTP ${res.status})`);
     }
-    const contentType = response.headers.get("content-type") ?? "";
-    const finalUrl = response.url || task.sourceUrl;
-    const looksHls =
-      contentType.includes("mpegurl") ||
-      contentType.includes("vnd.apple") ||
-      /\.m3u8(\?|$)/i.test(finalUrl);
+    const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
+    const hintsPlaylist =
+      /\.m3u8($|\?)/i.test(finalUrl) || contentType.includes("mpegurl") || contentType.includes("vnd.apple");
+    const hintsPage = contentType.includes("text/html") || contentType.includes("application/json");
 
-    if (looksHls) {
-      const playlist = await response.text();
-      if (!playlist.trimStart().startsWith("#EXTM3U")) {
-        throw new Error("Playlist không hợp lệ");
+    if (!res.body) throw new Error("Không đọc được dữ liệu");
+    const reader = res.body.getReader();
+
+    const first = await reader.read();
+    if (first.done || !first.value) throw new Error("Phản hồi trống");
+    const head = first.value;
+    const sniff = new TextDecoder().decode(head.subarray(0, Math.min(head.length, 512))).trimStart();
+
+    const readRest = async (): Promise<Uint8Array> => {
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      for (;;) {
+        if (task.abort.signal.aborted) throw new DOMException("Aborted", "AbortError");
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.length) {
+          chunks.push(value);
+          total += value.length;
+        }
       }
-      await this.downloadHls(task, finalUrl, playlist, append);
-    } else {
-      await this.downloadDirect(task, response, append);
+      const out = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return out;
+    };
+
+    const concatText = (rest: Uint8Array): string => {
+      const all = new Uint8Array(head.length + rest.length);
+      all.set(head, 0);
+      all.set(rest, head.length);
+      return new TextDecoder().decode(all);
+    };
+
+    const isPlaylist = sniff.startsWith("#EXTM3U");
+
+    if (isPlaylist || (hintsPlaylist && !hintsPage && !sniff.startsWith("<"))) {
+      const text = concatText(await readRest());
+      if (!text.trimStart().startsWith("#EXTM3U")) throw new Error("Playlist không hợp lệ");
+      await this.downloadHls(task, finalUrl, text, append);
+      return;
     }
+
+    if (sniff.startsWith("<") || sniff.startsWith("{") || hintsPage) {
+      const html = concatText(await readRest());
+      const resolved = extractNguoncStreamUrl(html, finalUrl);
+      if (resolved && resolved !== task.sourceUrl && depth < RESOLVE_MAX_DEPTH) {
+        task.message = "Đang phân giải luồng…";
+        this.emit();
+        task.sourceUrl = resolved;
+        await this.downloadInto(task, append, depth + 1);
+        return;
+      }
+      throw new Error("Không tìm thấy luồng video trong trang trả về");
+    }
+
+    // File nhị phân (mp4/ts trực tiếp): ghi chunk đầu rồi stream phần còn lại.
+    const total = Number(res.headers.get("content-length") ?? 0);
+    const MB = 1024 * 1024;
+    task.totalUnits = total > 0 ? Math.max(1, Math.ceil(total / MB)) : 0;
+    task.message = "Đang tải…";
+    this.emit();
+
+    await append(head);
+    task.loadedBytes += head.length;
+    if (total > 0) task.doneUnits = Math.min(task.totalUnits, Math.floor(task.loadedBytes / MB));
+
+    let lastEmit = 0;
+    for (;;) {
+      if (task.abort.signal.aborted) throw new DOMException("Aborted", "AbortError");
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.length) {
+        await append(value);
+        task.loadedBytes += value.length;
+        if (total > 0) task.doneUnits = Math.min(task.totalUnits, Math.floor(task.loadedBytes / MB));
+        const now = performance.now();
+        if (now - lastEmit > 250) {
+          this.updateSpeed(task);
+          lastEmit = now;
+          this.emit();
+        }
+      }
+    }
+    task.doneUnits = task.totalUnits;
   }
 
   private async downloadHls(
@@ -387,11 +604,11 @@ class DownloadManager {
   ): Promise<void> {
     if (playlist.includes("#EXT-X-STREAM-INF")) {
       const variantUrl = pickBestVariant(playlist, baseUrl);
-      const variant = await this.fetchProxied(variantUrl, task);
+      const { res: variant, finalUrl: variantFinal } = await this.fetchProxied(variantUrl, task);
       if (!variant.ok) throw new Error(`Lỗi tải playlist (HTTP ${variant.status})`);
       const text = await variant.text();
       if (!text.trimStart().startsWith("#EXTM3U")) throw new Error("Playlist không hợp lệ");
-      await this.downloadHls(task, variant.url || variantUrl, text, append);
+      await this.downloadHls(task, variantFinal, text, append);
       return;
     }
 
@@ -404,7 +621,7 @@ class DownloadManager {
 
     let keyBytes: ArrayBuffer | null = null;
     if (keyInfo) {
-      const keyResponse = await this.fetchProxied(keyInfo.uri, task);
+      const { res: keyResponse } = await this.fetchProxied(keyInfo.uri, task);
       if (!keyResponse.ok) throw new Error("Không tải được khóa giải mã");
       keyBytes = await keyResponse.arrayBuffer();
     }
@@ -417,7 +634,7 @@ class DownloadManager {
         nextIndex += 1;
         if (index >= segments.length) return;
         const segment = segments[index];
-        const response = await this.fetchProxied(segment.url, task);
+        const { res: response } = await this.fetchProxied(segment.url, task);
         if (!response.ok) {
           throw new Error(`Lỗi tải phân đoạn ${index + 1} (HTTP ${response.status})`);
         }
@@ -434,39 +651,6 @@ class DownloadManager {
     };
 
     await Promise.all(Array.from({ length: Math.min(CONCURRENCY, segments.length) }, () => worker()));
-  }
-
-  private async downloadDirect(
-    task: TaskInternal,
-    response: Response,
-    append: (bytes: Uint8Array) => Promise<void>,
-  ): Promise<void> {
-    const total = Number(response.headers.get("content-length") ?? 0);
-    const MB = 1024 * 1024;
-    task.totalUnits = total > 0 ? Math.max(1, Math.ceil(total / MB)) : 0;
-    task.message = "Đang tải…";
-    this.emit();
-    if (!response.body) throw new Error("Không đọc được dữ liệu");
-
-    const reader = response.body.getReader();
-    let lastEmit = 0;
-    for (;;) {
-      if (task.abort.signal.aborted) throw new DOMException("Aborted", "AbortError");
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value) {
-        await append(value);
-        task.loadedBytes += value.byteLength;
-        if (total > 0) task.doneUnits = Math.min(task.totalUnits, Math.floor(task.loadedBytes / MB));
-        const now = performance.now();
-        if (now - lastEmit > 250) {
-          this.updateSpeed(task);
-          lastEmit = now;
-          this.emit();
-        }
-      }
-    }
-    task.doneUnits = task.totalUnits;
   }
 }
 
