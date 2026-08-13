@@ -18,6 +18,8 @@ export type TsProbe = {
   audioSampleRate: number | null;
   /** PTS của PES video đầu tiên (đồng hồ 90 kHz). */
   videoPts: number | null;
+  /** PTS của PES âm thanh đầu tiên (đồng hồ 90 kHz). */
+  audioPts: number | null;
   /** Chữ ký 24 byte đầu của SPS (phân biệt các lần mã hóa khác nhau cùng codec). */
   spsHash: string | null;
   /** Khóa phân nhóm: các phân đoạn cùng key là cùng một luồng mã hóa. */
@@ -84,6 +86,7 @@ export function probeTsSegment(data: Uint8Array): TsProbe | null {
   let videoCodec: TsVideoCodec = null;
   let audioCodec: TsAudioCodec = null;
   let videoPts: number | null = null;
+  let audioPts: number | null = null;
   let spsHash: string | null = null;
   let audioSampleRate: number | null = null;
   // Đã xem qua packet PUSI âm thanh đầu tiên (để biết lúc nào được dừng chờ ADTS).
@@ -157,17 +160,20 @@ export function probeTsSegment(data: Uint8Array): TsProbe | null {
       // đầu tiên. Chỉ tin đúng vị trí này — quét dò giữa dữ liệu nén dễ trúng mẫu
       // giả (0xFF F1) và nhận nhầm tần số, làm hỏng việc phân nhóm profile.
       if (
-        audioSampleRate === null &&
+        (audioSampleRate === null || audioPts === null) &&
         audioCodec === "aac" &&
         audioPid !== null &&
         pid === audioPid &&
         pusi
       ) {
         if (data[payload] === 0x00 && data[payload + 1] === 0x00 && data[payload + 2] === 0x01) {
-          const adtsStart = payload + 9 + data[payload + 8];
-          if (adtsStart + 3 <= data.length) {
-            if (data[adtsStart] === 0xff && (data[adtsStart + 1] & 0xf6) === 0xf0) {
-              audioSampleRate = ADTS_SAMPLE_RATES[(data[adtsStart + 2] & 0x3c) >> 2] ?? null;
+          if (audioPts === null) audioPts = readPesPts(data, payload);
+          if (audioSampleRate === null) {
+            const adtsStart = payload + 9 + data[payload + 8];
+            if (adtsStart + 3 <= data.length) {
+              if (data[adtsStart] === 0xff && (data[adtsStart + 1] & 0xf6) === 0xf0) {
+                audioSampleRate = ADTS_SAMPLE_RATES[(data[adtsStart + 2] & 0x3c) >> 2] ?? null;
+              }
             }
           }
           audioChecked = true;
@@ -179,18 +185,8 @@ export function probeTsSegment(data: Uint8Array): TsProbe | null {
     if (pusi) {
       // PES
       if (data[payload] === 0x00 && data[payload + 1] === 0x00 && data[payload + 2] === 0x01) {
-        const ptsFlags = data[payload + 7] & 0xc0;
-        if (ptsFlags >= 0x80 && payload + 14 <= data.length) {
-          // Trích 33-bit PTS (giống cách mux.js đọc).
-          let pts =
-            ((data[payload + 9] & 0x0e) << 27) |
-            ((data[payload + 10] & 0xff) << 20) |
-            ((data[payload + 11] & 0xfe) << 12) |
-            ((data[payload + 12] & 0xff) << 5) |
-            ((data[payload + 13] & 0xfe) >>> 3);
-          pts = pts * 4 + ((data[payload + 13] & 0x06) >>> 1);
-          if (videoPts === null) videoPts = pts;
-        }
+        const pts = readPesPts(data, payload);
+        if (videoPts === null && pts !== null) videoPts = pts;
         const pesHeaderLength = data[payload + 8];
         const pesData = payload + 9 + pesHeaderLength;
         const chunk = data.subarray(pesData, Math.min(data.length, pesData + 4096));
@@ -226,9 +222,26 @@ export function probeTsSegment(data: Uint8Array): TsProbe | null {
     audioCodec,
     audioSampleRate,
     videoPts,
+    audioPts,
     spsHash,
     profileKey: `${videoCodec}|${spsHash ?? "?"}|${audioCodec ?? "?"}|${audioSampleRate ?? "?"}`,
   };
+}
+
+/** Trích 33-bit PTS từ header PES (đồng hồ 90 kHz); null khi packet không có PTS. */
+function readPesPts(data: Uint8Array, payload: number): number | null {
+  if (payload + 14 > data.length) return null;
+  const ptsFlags = data[payload + 7] & 0xc0;
+  if (ptsFlags < 0x80) return null;
+  // Trích 33-bit PTS (giống cách mux.js đọc).
+  let pts =
+    ((data[payload + 9] & 0x0e) << 27) |
+    ((data[payload + 10] & 0xff) << 20) |
+    ((data[payload + 11] & 0xfe) << 12) |
+    ((data[payload + 12] & 0xff) << 5) |
+    ((data[payload + 13] & 0xfe) >>> 3);
+  pts = pts * 4 + ((data[payload + 13] & 0x06) >>> 1);
+  return pts;
 }
 
 /** Tìm SPS đầu tiên từ vị trí `from`; trả về ≤24 byte ngay sau start code. */

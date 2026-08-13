@@ -1025,7 +1025,8 @@ class DownloadManager {
       if (remuxer) {
         const probe = finalProbes[i] as TsProbe;
         const ptsSeconds = (probe.videoPts as number) / 90000;
-        const result = await remuxer.push(data, ptsSeconds, expectedStart);
+        const audioPtsSeconds = probe.audioPts !== null ? probe.audioPts / 90000 : null;
+        const result = await remuxer.push(data, ptsSeconds, audioPtsSeconds, expectedStart);
         // Đoạn cực ngắn (VD 0.04s ở cuối playlist) có thể không tạo mảnh nào —
         // bỏ qua nhưng vẫn giữ dòng thời gian để các đoạn sau khớp vị trí.
         for (const chunk of result.chunks) {
