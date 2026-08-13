@@ -11,7 +11,7 @@ import {
   type HubDetail,
   type HubSource,
 } from "@/lib/hub";
-import { getWatchMemory, saveWatchMemory } from "@/lib/watch-memory";
+import { getWatchMemory, readDetailFrom, saveWatchMemory } from "@/lib/watch-memory";
 
 const SOURCE_META: Record<HubSource, { label: string; color: string }> = {
   nguonc: { label: "NC", color: "bg-emerald-500" },
@@ -20,8 +20,11 @@ const SOURCE_META: Record<HubSource, { label: string; color: string }> = {
 
 const SOURCES: HubSource[] = ["nguonc", "kk"];
 
+/** Chấp nhận cả dạng rút gọn (nc/kk) lẫn dạng đầy đủ cũ (nguonc/kk) trong URL. */
 function toSource(v: string | null, fallback: HubSource = "nguonc"): HubSource {
-  return v && (SOURCES as string[]).includes(v) ? (v as HubSource) : fallback;
+  if (v === "nc" || v === "nguonc") return "nguonc";
+  if (v === "kk") return "kk";
+  return fallback;
 }
 
 function toInt(v: string | null, min: number, fallback: number): number {
@@ -67,9 +70,10 @@ export default function PhimDetail() {
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
 
-  const from = toSource(params.get("from"));
-  const server = toInt(params.get("server"), 0, 0);
-  const ep = toInt(params.get("ep"), 0, 0);
+  // Ưu tiên tham số URL (mới f= hoặc cũ from=), rồi đến nguồn đã click trên danh sách.
+  const from = toSource(params.get("from") ?? params.get("f") ?? readDetailFrom(slug));
+  const server = toInt(params.get("server") ?? params.get("s"), 0, 0);
+  const ep = toInt(params.get("ep") ?? params.get("e"), 0, 0);
 
   const playerRef = useRef<HTMLDivElement>(null);
   const activeEpRef = useRef<HTMLButtonElement>(null);
@@ -121,14 +125,13 @@ export default function PhimDetail() {
 
   const setSearch = useCallback(
     (next: { from: HubSource; server: number; ep: number }, replace = false): void => {
-      setParams(
-        {
-          from: next.from,
-          server: String(next.server),
-          ep: String(next.ep),
-        },
-        { replace },
-      );
+      // Chỉ ghi các giá trị khác mặc định để URL ngắn nhất có thể:
+      // /phim/<slug>, /phim/<slug>?f=kk, /phim/<slug>?s=1&e=3, /phim/<slug>?f=kk&e=5…
+      const compact: Record<string, string> = {};
+      if (next.from === "kk") compact.f = "kk";
+      if (next.server !== 0) compact.s = String(next.server);
+      if (next.ep !== 0) compact.e = String(next.ep);
+      setParams(compact, { replace });
     },
     [setParams],
   );
@@ -136,7 +139,7 @@ export default function PhimDetail() {
   useEffect(() => {
     if (restoredRef.current || !data) return;
     restoredRef.current = true;
-    if (params.get("from") || params.get("server") || params.get("ep")) return;
+    if (params.get("from") || params.get("f") || params.get("server") || params.get("s") || params.get("ep") || params.get("e")) return;
     const mem = getWatchMemory("hub", slug);
     if (!mem) return;
     const memFrom = toSource(mem.from ?? null, from);

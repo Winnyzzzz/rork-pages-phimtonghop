@@ -74,7 +74,7 @@ export function clearListPosition(scope: string): void {
 }
 
 // Trạng thái danh sách (tab nguồn, trang, tìm kiếm, bộ lọc) lưu 1 bản duy nhất
-// trong sessionStorage để giữ URL ngắn gọn: /phim/<slug>?from=<nguồn> là đủ.
+// trong sessionStorage để giữ URL ngắn gọn: /phim/<slug> là đủ.
 export type ListState = {
   source: string;
   page: number;
@@ -103,4 +103,19 @@ export function readListState(): ListState | null {
   } catch {
     return null;
   }
+}
+
+// Nguồn được click trên danh sách, lưu theo slug để URL chi tiết không cần ?from=...
+const DETAIL_FROM_KEY = "detail-from:v1";
+
+export function saveDetailFrom(slug: string, source: string): void {
+  if (typeof window === "undefined") return;
+  const store = readStore<string>(window.sessionStorage, DETAIL_FROM_KEY);
+  store[slug] = source;
+  writeStore(window.sessionStorage, DETAIL_FROM_KEY, store);
+}
+
+export function readDetailFrom(slug: string): string | null {
+  if (typeof window === "undefined") return null;
+  return readStore<string>(window.sessionStorage, DETAIL_FROM_KEY)[slug] ?? null;
 }

@@ -14,6 +14,7 @@ import {
 import {
   readListPosition,
   readListState,
+  saveDetailFrom,
   saveListPosition,
   saveListState,
   type ListState,
@@ -144,7 +145,8 @@ export default function PhimTongHop() {
   const openDetail = (item: HubItem): void => {
     const cardId = `${item.source}:${item.slug}`;
     saveListPosition(scope, cardId, window.scrollY);
-    navigate(`/phim/${encodeURIComponent(item.slug)}?from=${item.source}`);
+    saveDetailFrom(item.slug, item.source);
+    navigate(`/phim/${encodeURIComponent(item.slug)}`);
   };
 
   return (
@@ -220,7 +222,7 @@ export default function PhimTongHop() {
           return (
             <Link
               key={cardId}
-              to={`/phim/${encodeURIComponent(item.slug)}?from=${item.source}`}
+              to={`/phim/${encodeURIComponent(item.slug)}`}
               data-card-id={cardId}
               onClick={(e) => {
                 e.preventDefault();
