@@ -80,6 +80,7 @@ export default function PhimDetail() {
   const userActionRef = useRef<boolean>(false);
   const restoredRef = useRef<boolean>(false);
   const initialScrollRef = useRef<boolean>(false);
+  const epScrollInitRef = useRef<boolean>(false);
   const [entry, setEntry] = useState<{ slug: string; source: HubSource }>({ slug, source: from });
   const [progressiveData, setProgressiveData] = useState<HubDetail | undefined>();
 
@@ -185,6 +186,12 @@ export default function PhimDetail() {
   }, [currentEp]);
 
   useEffect(() => {
+    // Không tự cuộn tới danh sách tập khi mới mở trang (để giữ thanh
+    // "Về danh sách / Chia sẻ" luôn nhìn thấy); chỉ cuộn khi người dùng đổi server.
+    if (!epScrollInitRef.current) {
+      epScrollInitRef.current = true;
+      return;
+    }
     activeEpRef.current?.scrollIntoView({ behavior: "auto", block: "nearest", inline: "nearest" });
   }, [data?.slug, from, server]);
 
@@ -201,7 +208,7 @@ export default function PhimDetail() {
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-6">
-      <div className="mb-3 flex items-center justify-between gap-2">
+      <div className="sticky top-0 z-20 -mx-4 mb-3 flex items-center justify-between gap-2 border-b bg-background/85 px-4 py-2 backdrop-blur">
         <Link
           to={backHref}
           onClick={(e) => {
@@ -229,7 +236,7 @@ export default function PhimDetail() {
 
       {data && (
         <>
-          <div ref={playerRef} className="mb-4 overflow-hidden rounded-lg bg-black">
+          <div ref={playerRef} className="mb-4 scroll-mt-14 overflow-hidden rounded-lg bg-black">
             <div className="aspect-video w-full">
               {currentEp?.embed ? (
                 <iframe
