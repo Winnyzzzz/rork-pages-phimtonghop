@@ -5,6 +5,9 @@
 //    tiếp từ trình duyệt người dùng.
 //  - Phân đoạn HLS được tải song song NHƯNG ghi vào file theo ĐÚNG THỨ TỰ playlist
 //    (ghi lộn thứ tự làm hỏng dòng MPEG-TS → file tải về xem bị cắt/giật).
+//  - Phát hiện phần mở đầu giống trailer/intro (đoạn ngắn tách bởi discontinuity)
+//    và bỏ qua khi ghép file — ghép lẫn codec/độ phân giải khiến trình phát dừng
+//    sau vài chục giây.
 //  - Kiểm tra dữ liệu từng phân đoạn (sync byte TS / box MP4) và thử lại tối đa 3
 //    lần — bắt lỗi máy chủ trả trang lỗi HTML thay vì video (file "đủ dung lượng
 //    nhưng chỉ xem được vài giây").
@@ -26,18 +29,23 @@ export type DownloadTask = {
   doneUnits: number;
   speedBps: number;
   message: string;
+  playlistSummary?: string;
+  hasPlaylist: boolean;
 };
 
 type TaskInternal = DownloadTask & {
   abort: AbortController;
   lastTick: number;
   lastBytes: number;
+  expectedSeconds?: number;
+  playlistTexts: string[];
 };
 
 type KeyRef = { uri?: string; ivHex?: string };
 type RangeRef = { length: number; offset: number };
 type SegmentMeta = {
   url: string;
+  duration: number;
   key?: KeyRef;
   byteRange?: RangeRef;
   map?: { url: string; byteRange?: RangeRef };
@@ -49,6 +57,7 @@ type ParsedPlaylist = {
   hasMap: boolean;
   isEndList: boolean;
   hasDiscontinuity: boolean;
+  discontinuities: number[];
 };
 type ProxiedResponse = { res: Response; finalUrl: string };
 type FinishedBuffer = { blob: Blob; opfsName: string | null; size: number };
@@ -166,6 +175,8 @@ function pickBestVariant(text: string, baseUrl: string): string {
     const attrs = parseAttrs(line.slice(18));
     const next = lines[i + 1]?.trim() ?? "";
     if (!next || next.startsWith("#")) continue;
+    // Bỏ qua luồng có tên gợi ý trailer/quảng cáo trong master playlist.
+    if (/(trailer|preview|teaser)/i.test(next)) continue;
     const url = new URL(next, baseUrl).href;
     const bandwidth = parseInt(attrs.BANDWIDTH ?? "0", 10) || 0;
     const score =
@@ -189,6 +200,8 @@ function parseMediaPlaylist(text: string, baseUrl: string): ParsedPlaylist {
   let currentKey: KeyRef | undefined;
   let currentMap: SegmentMeta["map"];
   let pendingRange: RangeRef | undefined;
+  let pendingDuration = 0;
+  const discontinuities: number[] = [];
   let hasMap = false;
   let isEndList = false;
   let hasDiscontinuity = false;
@@ -199,7 +212,8 @@ function parseMediaPlaylist(text: string, baseUrl: string): ParsedPlaylist {
     if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
       mediaSequence = parseInt(line.slice(22), 10) || 0;
     } else if (line.startsWith("#EXTINF")) {
-      totalDuration += parseFloat(line.slice(8).split(",")[0]) || 0;
+      pendingDuration = parseFloat(line.slice(8).split(",")[0]) || 0;
+      totalDuration += pendingDuration;
     } else if (line.startsWith("#EXT-X-KEY:")) {
       const attrs = parseAttrs(line.slice(11));
       const method = (attrs.METHOD ?? "").toUpperCase();
@@ -225,6 +239,7 @@ function parseMediaPlaylist(text: string, baseUrl: string): ParsedPlaylist {
       pendingRange = parseByteRange(line.slice(17));
     } else if (line.startsWith("#EXT-X-DISCONTINUITY")) {
       hasDiscontinuity = true;
+      discontinuities.push(segments.length);
       // MAP không còn hiệu lực sau discontinuity (spec HLS).
       currentMap = undefined;
     } else if (line.startsWith("#EXT-X-ENDLIST")) {
@@ -232,14 +247,16 @@ function parseMediaPlaylist(text: string, baseUrl: string): ParsedPlaylist {
     } else if (!line.startsWith("#")) {
       segments.push({
         url: new URL(line, baseUrl).href,
+        duration: pendingDuration,
         key: currentKey,
         byteRange: pendingRange,
         map: currentMap,
       });
+      pendingDuration = 0;
       pendingRange = undefined;
     }
   }
-  return { segments, mediaSequence, totalDuration, hasMap, isEndList, hasDiscontinuity };
+  return { segments, mediaSequence, totalDuration, hasMap, isEndList, hasDiscontinuity, discontinuities };
 }
 
 function ivFor(ivHex: string | undefined, sequence: number): Uint8Array {
@@ -415,6 +432,10 @@ class DownloadManager {
 
   getSnapshot = (): DownloadTask[] => this.snapshot;
 
+  /** Lấy toàn bộ nội dung playlist đã tải (dùng để chẩn đoán/báo lỗi). */
+  getPlaylistText = (id: string): string | null =>
+    this.tasks.find((t) => t.id === id)?.playlistTexts.join("\n\n") ?? null;
+
   private emit(): void {
     this.snapshot = this.tasks.map((t) => ({
       id: t.id,
@@ -427,12 +448,14 @@ class DownloadManager {
       doneUnits: t.doneUnits,
       speedBps: t.speedBps,
       message: t.message,
+      playlistSummary: t.playlistSummary,
+      hasPlaylist: t.playlistTexts.length > 0,
     }));
     this.listeners.forEach((listener) => listener());
   }
 
   /** Thêm tác vụ tải. Trả về false nếu URL này đang chờ/tải. */
-  add(label: string, sourceUrl: string, fileName: string): boolean {
+  add(label: string, sourceUrl: string, fileName: string, expectedSeconds?: number): boolean {
     const normalized = normalizeSourceUrl(sourceUrl);
     const duplicate = this.tasks.some(
       (t) => t.sourceUrl === normalized && (t.status === "queued" || t.status === "active"),
@@ -449,9 +472,13 @@ class DownloadManager {
       doneUnits: 0,
       speedBps: 0,
       message: "Chờ tải…",
+      playlistSummary: undefined,
+      hasPlaylist: false,
       abort: new AbortController(),
       lastTick: 0,
       lastBytes: 0,
+      expectedSeconds,
+      playlistTexts: [],
     };
     this.tasks.push(task);
     this.emit();
@@ -698,6 +725,11 @@ class DownloadManager {
     playlist: string,
     append: (bytes: Uint8Array) => Promise<void>,
   ): Promise<void> {
+    // Lưu lại nội dung playlist để người dùng có thể sao chép và báo lỗi (chẩn đoán).
+    task.playlistTexts.push(
+      `=== ${task.playlistTexts.length === 0 ? "Playlist tải về" : "Playlist con"} (${baseUrl}) ===\n${playlist}`,
+    );
+
     if (playlist.includes("#EXT-X-STREAM-INF")) {
       const variantUrl = pickBestVariant(playlist, baseUrl);
       const { res: variant, finalUrl: variantFinal } = await this.fetchProxied(variantUrl, task);
@@ -711,19 +743,62 @@ class DownloadManager {
     const parsed = parseMediaPlaylist(playlist, baseUrl);
     if (parsed.segments.length === 0) throw new Error("Không tìm thấy phân đoạn video");
 
-    // Đặt đuôi file theo định dạng thật: fMP4 có init segment → .mp4; MPEG-TS → .ts
-    // (lưu TS dưới tên .mp4 khiến nhiều trình phát hiểu nhầm container).
-    const wantedExt = parsed.hasMap ? ".mp4" : ".ts";
+    // Phát hiện phần mở đầu giống trailer/intro: các phân đoạn trước điểm
+    // discontinuity đầu tiên ngắn (≤ 90s) và phần còn lại dài gấp ≥ 3 lần.
+    // Ghép lẫn codec/độ phân giải khiến trình phát dừng ngay tại ranh giới,
+    // nên bỏ qua phần mở đầu khi ghi file để tập phim phát liền mạch.
+    let skipCount = 0;
+    let skippedDuration = 0;
+    if (parsed.discontinuities.length > 0) {
+      const firstBreak = parsed.discontinuities[0];
+      if (firstBreak > 0 && firstBreak < parsed.segments.length) {
+        const leadingDuration = parsed.segments
+          .slice(0, firstBreak)
+          .reduce((sum, segment) => sum + segment.duration, 0);
+        const restDuration = parsed.totalDuration - leadingDuration;
+        if (leadingDuration > 0 && leadingDuration <= 90 && restDuration >= leadingDuration * 3) {
+          skipCount = firstBreak;
+          skippedDuration = leadingDuration;
+        }
+      }
+    }
+
+    const kept = parsed.segments.slice(skipCount);
+    const keptDuration = parsed.totalDuration - skippedDuration;
+
+    // Đặt đuôi file theo định dạng thật của phần GIỮ LẠI: fMP4 có init segment → .mp4;
+    // MPEG-TS → .ts (lưu TS dưới tên .mp4 khiến nhiều trình phát hiểu nhầm container).
+    const wantedExt = kept.some((segment) => segment.map !== undefined) ? ".mp4" : ".ts";
     if (!task.fileName.toLowerCase().endsWith(wantedExt)) {
       const base = task.fileName.replace(/\.(ts|mp4|m4v|mkv|webm)$/i, "");
       task.fileName = `${base}${wantedExt}`;
     }
 
-    task.totalUnits = parsed.segments.length;
+    const summaryParts: string[] = [
+      `${parsed.segments.length} phân đoạn · tổng ${formatDuration(parsed.totalDuration)}`,
+    ];
+    if (skipCount > 0) summaryParts.push(`bỏ qua ${skipCount} đoạn mở đầu (${formatDuration(skippedDuration)})`);
+    if (parsed.discontinuities.length > 0) summaryParts.push(`${parsed.discontinuities.length} discontinuity`);
+    if (!parsed.isEndList) summaryParts.push("thiếu ENDLIST");
+    if (
+      task.expectedSeconds &&
+      parsed.totalDuration > 0 &&
+      parsed.totalDuration < task.expectedSeconds * 0.5
+    ) {
+      summaryParts.push(
+        `ngắn hơn nhiều so với tập dự kiến (${formatDuration(task.expectedSeconds)}) — có thể là trailer`,
+      );
+    }
+    task.playlistSummary = `Playlist: ${summaryParts.join(" · ")}`;
+
+    task.totalUnits = kept.length;
     task.message =
-      parsed.totalDuration > 0
-        ? `Đang tải ${parsed.segments.length} phân đoạn (${formatDuration(parsed.totalDuration)})…`
-        : `Đang tải ${parsed.segments.length} phân đoạn…`;
+      keptDuration > 0
+        ? `Đang tải ${kept.length} phân đoạn (${formatDuration(keptDuration)})…`
+        : `Đang tải ${kept.length} phân đoạn…`;
+    if (skipCount > 0) {
+      task.message += ` — đã bỏ qua phần mở đầu ${formatDuration(skippedDuration)} (trailer/intro)`;
+    }
     if (!parsed.isEndList) {
       task.message += " — playlist không có điểm kết thúc, có thể thiếu phần cuối";
     }
@@ -733,27 +808,28 @@ class DownloadManager {
     const mapCache = new Map<string, Uint8Array>();
 
     // Tải song song CONCURRENCY phân đoạn nhưng ghi vào file theo đúng thứ tự playlist.
-    const slots: Promise<Uint8Array>[] = new Array<Promise<Uint8Array>>(parsed.segments.length);
-    const startFetch = (index: number): void => {
+    const slots: Promise<Uint8Array>[] = new Array<Promise<Uint8Array>>(kept.length);
+    const startFetch = (keptIndex: number): void => {
+      const originalIndex = skipCount + keptIndex;
       const promise = this.fetchSegment(
         task,
-        parsed.segments[index],
-        parsed.mediaSequence + index,
+        parsed.segments[originalIndex],
+        parsed.mediaSequence + originalIndex,
         keyCache,
-        `${index + 1}/${parsed.segments.length}`,
+        `${originalIndex + 1}/${parsed.segments.length}`,
       );
-      slots[index] = promise;
+      slots[keptIndex] = promise;
       promise.catch(() => undefined); // tránh cảnh báo rejection trước khi await theo thứ tự
     };
-    for (let i = 0; i < Math.min(CONCURRENCY, parsed.segments.length); i += 1) startFetch(i);
+    for (let i = 0; i < Math.min(CONCURRENCY, kept.length); i += 1) startFetch(i);
 
     const writtenMaps = new Set<string>();
     let lastEmit = 0;
-    for (let i = 0; i < parsed.segments.length; i += 1) {
+    for (let i = 0; i < kept.length; i += 1) {
       const data = await slots[i];
-      if (i + CONCURRENCY < parsed.segments.length) startFetch(i + CONCURRENCY);
+      if (i + CONCURRENCY < kept.length) startFetch(i + CONCURRENCY);
 
-      const segment = parsed.segments[i];
+      const segment = kept[i];
       if (segment.map && !writtenMaps.has(segment.map.url)) {
         writtenMaps.add(segment.map.url);
         await append(await this.fetchMap(task, segment.map, mapCache));

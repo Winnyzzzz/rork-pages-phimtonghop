@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
-import { Download, X } from "lucide-react";
+import { ClipboardCopy, Download, X } from "lucide-react";
 
+import { toast } from "@/components/ui/sonner";
 import { downloadManager, type DownloadTask } from "@/lib/downloader";
 
 function formatBytes(value: number): string {
@@ -14,6 +15,40 @@ function formatSpeed(bps: number): string {
   if (bps <= 0) return "";
   if (bps < 1024 * 1024) return `${(bps / 1024).toFixed(0)} KB/s`;
   return `${(bps / 1024 / 1024).toFixed(1)} MB/s`;
+}
+
+/** Sao chép nội dung playlist của tác vụ để dán vào chat chẩn đoán. */
+async function copyPlaylist(id: string): Promise<void> {
+  const text = downloadManager.getPlaylistText(id);
+  if (!text) {
+    toast.error("Không có playlist để sao chép");
+    return;
+  }
+  let copied = false;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    }
+  } catch {
+    copied = false;
+  }
+  if (!copied) {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+      copied = document.execCommand("copy");
+    } catch {
+      copied = false;
+    }
+    textarea.remove();
+  }
+  if (copied) toast.success("Đã sao chép playlist — dán vào chat để chẩn đoán");
+  else toast.error("Không thể sao chép playlist");
 }
 
 export default function DownloadPanel() {
@@ -57,6 +92,21 @@ function TaskRow({ task }: { task: DownloadTask }) {
         {task.status === "cancelled" && <span className="text-muted-foreground">Đã hủy</span>}
         {active && <span className="text-muted-foreground">{task.message}</span>}
       </div>
+
+      {task.playlistSummary && (
+        <div className="mt-1 text-[11px] leading-snug text-muted-foreground">{task.playlistSummary}</div>
+      )}
+
+      {task.hasPlaylist && (
+        <button
+          type="button"
+          onClick={() => void copyPlaylist(task.id)}
+          className="mt-1 inline-flex min-h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium text-sky-600 transition hover:bg-muted"
+        >
+          <ClipboardCopy size={12} aria-hidden="true" />
+          Sao chép playlist (chẩn đoán)
+        </button>
+      )}
 
       {active && (
         <>

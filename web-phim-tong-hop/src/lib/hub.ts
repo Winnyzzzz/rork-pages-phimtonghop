@@ -32,6 +32,7 @@ export type HubDetail = {
   year?: string;
   country?: string;
   category?: string;
+  time?: string;
   bySource: Partial<Record<HubSource, { name: string; servers: HubServer[] } | { error: string }>>;
 };
 
@@ -252,6 +253,7 @@ type SourceDetail = {
   year?: string;
   country?: string;
   category?: string;
+  time?: string;
   servers: HubServer[];
 };
 
@@ -274,6 +276,7 @@ async function fetchNguoncDetail(slug: string): Promise<SourceDetail> {
     year: movie.category?.["3"]?.list?.[0]?.name,
     country: movie.category?.["4"]?.list?.map((x: any) => x.name).join(", "),
     category: movie.category?.["2"]?.list?.map((x: any) => x.name).join(", "),
+    time: movie.episode_time || movie.time || undefined,
     servers,
   };
 }
@@ -298,6 +301,7 @@ async function fetchKkDetail(slug: string): Promise<SourceDetail> {
     year: movie.year ? String(movie.year) : undefined,
     country: (movie.country ?? []).map((x: any) => x.name).join(", "),
     category: (movie.category ?? []).map((x: any) => x.name).join(", "),
+    time: movie.time ? String(movie.time) : undefined,
     servers,
   };
 }
@@ -370,6 +374,7 @@ function toPrimaryDetail(slug: string, source: HubSource, detail: SourceDetail):
     year: detail.year,
     country: detail.country,
     category: detail.category,
+    time: detail.time,
     bySource: { [source]: toSourceEntry(detail) },
   };
 }

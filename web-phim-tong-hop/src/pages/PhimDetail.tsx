@@ -34,6 +34,19 @@ function toInt(v: string | null, min: number, fallback: number): number {
   return Number.isFinite(n) ? Math.max(min, Math.trunc(n)) : fallback;
 }
 
+/** Đọc thời lượng một tập từ chuỗi như "9 phút/tập" hay "1 giờ 30 phút" (giây). */
+function parseEpisodeSeconds(time?: string): number | undefined {
+  if (!time) return undefined;
+  let total = 0;
+  const hours = /(\d+)\s*giờ/i.exec(time);
+  const minutes = /(\d+)\s*phút/i.exec(time);
+  const seconds = /(\d+)\s*giây/i.exec(time);
+  if (hours) total += Number(hours[1]) * 3600;
+  if (minutes) total += Number(minutes[1]) * 60;
+  if (seconds) total += Number(seconds[1]);
+  return total > 0 ? total : undefined;
+}
+
 /** Sao chép URL hiện tại vào khay nhớ tạm, kèm fallback cho trình duyệt cũ/ngữ cảnh không bảo mật. */
 async function copyCurrentUrl(): Promise<boolean> {
   const url = window.location.href;
@@ -214,6 +227,7 @@ export default function PhimDetail() {
         `${data.title} — ${episodeName}`,
         m3u8Url,
         `${base}${pickExtension(m3u8Url)}`,
+        parseEpisodeSeconds(data.time),
       );
       if (!added) toast.info("Tập này đang được tải");
     },
