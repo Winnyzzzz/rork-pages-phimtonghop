@@ -22,7 +22,7 @@ import {
 } from "@/lib/watch-memory";
 
 const TABS: { key: HubFeedSource; label: string; color: string }[] = [
-  { key: "all", label: "Tất cả nguồn", color: "bg-slate-900" },
+  { key: "all", label: "All", color: "bg-slate-900" },
   { key: "nguonc", label: "NC", color: "bg-emerald-500" },
   { key: "kk", label: "KK", color: "bg-sky-500" },
 ];
