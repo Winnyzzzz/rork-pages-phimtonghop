@@ -57,6 +57,8 @@ type TaskInternal = DownloadTask & {
   lastBytes: number;
   expectedSeconds?: number;
   finished: FinishedBuffer | null;
+  /** Referer của trang nơi luồng được nhúng — cần cho CDN kiểm tra referer. */
+  resolveReferer?: string;
   webViewSave?: WebViewSave;
 };
 
@@ -115,6 +117,43 @@ function toBase64Url(value: string): string {
 
 function proxyUrlFor(target: string): string {
   return `/download/${toBase64Url(target)}`;
+}
+
+type EmbedResolve = { url: string; referer?: string; error?: string } | null;
+
+/**
+ * Phân giải link nhúng (embed) qua Pages Function /nc-api/resolve: function
+ * lần theo iframe/player của trang embed (streamc.xyz…) để tìm luồng .m3u8/.mp4
+ * thật — thứ mà trình duyệt không đọc được vì CORS. Trả về URL luồng + referer,
+ * hoặc lỗi chi tiết để hiển thị cho người dùng.
+ */
+async function resolveEmbedViaApi(url: string, signal?: AbortSignal): Promise<EmbedResolve> {
+  try {
+    const res = await fetch(`/nc-api/resolve?url=${encodeURIComponent(toBase64Url(url))}`, {
+      headers: { "x-dl-key": DL_KEY },
+      signal,
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      kind?: string;
+      url?: string;
+      referer?: string;
+      message?: string;
+    };
+    if (
+      (data.kind === "hls" || data.kind === "direct") &&
+      typeof data.url === "string" &&
+      /^https?:\/\//i.test(data.url)
+    ) {
+      return { url: data.url, referer: typeof data.referer === "string" ? data.referer : undefined };
+    }
+    if (data.kind === "error" && typeof data.message === "string") {
+      return { url: "", error: data.message };
+    }
+  } catch {
+    // function không khả dụng (preview) — bỏ qua, luồng cũ vẫn chạy
+  }
+  return null;
 }
 
 function uuid(): string {
@@ -623,7 +662,7 @@ class DownloadManager {
     }
     if (host && !this.proxyDeadHosts.has(host)) {
       const headers: Record<string, string> = { "x-dl-key": DL_KEY };
-      const referer = siteRefererFor(url);
+      const referer = task.resolveReferer ?? siteRefererFor(url);
       if (referer) headers["x-dl-referer"] = referer;
       if (range) headers["x-dl-range"] = `bytes=${range.offset}-${range.offset + range.length - 1}`;
       try {
@@ -810,7 +849,14 @@ class DownloadManager {
       if (resolved && resolved !== url && depth < RESOLVE_MAX_DEPTH) {
         return this.resolveSourceForWebView(task, resolved, depth + 1);
       }
-      throw new Error("Không tìm thấy luồng video trong trang trả về");
+      // Link nhúng không lộ luồng trong HTML — nhờ function lần theo iframe/player.
+      const viaApi = await resolveEmbedViaApi(url, task.abort.signal);
+      if (viaApi?.url) {
+        if (/\.m3u8($|\?)/i.test(viaApi.url)) return { kind: "hls", url: viaApi.url };
+        return { kind: "direct", url: viaApi.url };
+      }
+      if (viaApi?.error) throw new Error(`Không dò được luồng trong link nhúng: ${viaApi.error}`);
+      throw new Error("Không tìm thấy luồng video trong link nhúng");
     }
 
     // File nhị phân (mp4/ts trực tiếp) — trình duyệt tải thẳng được.
@@ -881,7 +927,19 @@ class DownloadManager {
 
     if (sniff.startsWith("<") || sniff.startsWith("{") || hintsPage) {
       const html = concatText(await readRest());
-      const resolved = extractNguoncStreamUrl(html, finalUrl);
+      let resolved = extractNguoncStreamUrl(html, finalUrl);
+      if (!resolved) {
+        // Link nhúng (embed) — luồng ẩn trong iframe/player: dùng function dò giúp.
+        task.message = "Đang dò luồng trong link nhúng…";
+        this.emit();
+        const viaApi = await resolveEmbedViaApi(task.sourceUrl, task.abort.signal);
+        if (viaApi?.url) {
+          resolved = viaApi.url;
+          task.resolveReferer = viaApi.referer;
+        } else if (viaApi?.error) {
+          throw new Error(`Không dò được luồng trong link nhúng: ${viaApi.error}`);
+        }
+      }
       if (resolved && resolved !== task.sourceUrl && depth < RESOLVE_MAX_DEPTH) {
         task.message = "Đang phân giải luồng…";
         this.emit();
@@ -889,7 +947,7 @@ class DownloadManager {
         await this.downloadInto(task, append, depth + 1);
         return;
       }
-      throw new Error("Không tìm thấy luồng video trong trang trả về");
+      throw new Error("Không tìm thấy luồng video trong link nhúng");
     }
 
     // File nhị phân (mp4/ts trực tiếp): ghi chunk đầu rồi stream phần còn lại.
