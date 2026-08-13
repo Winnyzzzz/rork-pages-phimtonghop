@@ -132,9 +132,22 @@ export default function PhimDetail() {
   const primaryForSlug = entry.slug === slug ? primaryData : undefined;
 
   const { data: alternateSources, isFetching: isLoadingAlternates } = useQuery({
-    queryKey: ["hub-detail-alternates", entry.slug, entry.source, primaryForSlug?.title, primaryForSlug?.originName],
+    queryKey: [
+      "hub-detail-alternates",
+      entry.slug,
+      entry.source,
+      primaryForSlug?.title,
+      primaryForSlug?.originName,
+      primaryForSlug?.year,
+    ],
     queryFn: () =>
-      getHubDetailAlternates(entry.slug, entry.source, primaryForSlug!.title, primaryForSlug!.originName),
+      getHubDetailAlternates(
+        entry.slug,
+        entry.source,
+        primaryForSlug!.title,
+        primaryForSlug!.originName,
+        primaryForSlug!.year,
+      ),
     staleTime: 10 * 60_000,
     enabled: !!primaryForSlug && entry.slug === slug,
   });
@@ -370,7 +383,15 @@ export default function PhimDetail() {
                     key={s}
                     disabled={!ok}
                     onClick={() => nav({ from: s, server: 0, ep: 0 })}
-                    title={isPending ? "Đang tải nguồn này…" : !ok ? "Nguồn này không có phim" : ""}
+                    title={
+                      isPending
+                        ? "Đang tải nguồn này…"
+                        : !ok
+                          ? src && "error" in src
+                            ? src.error
+                            : "Nguồn này không có phim"
+                          : ""
+                    }
                     className={`flex min-w-0 items-center justify-center gap-1.5 rounded-md px-3 py-2 text-sm font-semibold transition ${
                       activeSource === s
                         ? `${meta.color} text-white shadow-sm`

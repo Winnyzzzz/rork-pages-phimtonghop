@@ -413,22 +413,115 @@ function titlesMatch(a: Pick<SourceDetail, "name" | "originName">, refName: stri
   return names.some((n) => refs.some((r) => titlesEquivalent(n, r)));
 }
 
-/** Finds the slug on `source` whose title matches the reference movie. */
-async function findSlugByTitle(
+const NUMBER_WORDS: Record<string, string> = {
+  "0": "khong", "1": "mot", "2": "hai", "3": "ba", "4": "bon",
+  "5": "nam", "6": "sau", "7": "bay", "8": "tam", "9": "chin", "10": "muoi",
+};
+
+/** Tập từ khóa của một tiêu đề (đã chuẩn hóa); số viết bằng chữ số quy về chữ. */
+function titleTokens(value?: string): Set<string> {
+  const words = normalizeTitle(value ?? "").split(" ").filter(Boolean);
+  return new Set(words.map((word) => NUMBER_WORDS[word] ?? word));
+}
+
+/** Điểm tương đồng Jaccard giữa hai tiêu đề (0..1). */
+function titleSimilarity(a?: string, b?: string): number {
+  const tokensA = titleTokens(a);
+  const tokensB = titleTokens(b);
+  if (tokensA.size === 0 || tokensB.size === 0) return 0;
+  let shared = 0;
+  for (const token of tokensA) if (tokensB.has(token)) shared += 1;
+  return shared / (tokensA.size + tokensB.size - shared);
+}
+
+/** Các biến thể từ khóa để tìm trên nguồn khác: tên chính, tên gốc, tên đã bỏ phần trong ngoặc. */
+function searchKeywordVariants(name?: string, origin?: string): string[] {
+  const out: string[] = [];
+  const push = (value?: string): void => {
+    const trimmed = (value ?? "").trim();
+    if (trimmed.length > 1 && !out.includes(trimmed)) out.push(trimmed);
+  };
+  push(name);
+  push(origin);
+  if (name) {
+    push(name.replace(/[\(（\[【].*?[\)）\]】]/g, " ").replace(/\s+/g, " ").trim());
+  }
+  return out;
+}
+
+/**
+ * Tìm phim trên nguồn khác theo tên. Tên tiếng Việt giữa KK và NC thường được
+ * dịch khác nhau ("... Phần 2" vs "... 2", "... Thứ 2" vs "... Thứ hai"…) nên
+ * không thể chỉ khớp tuyệt đối: gom ứng viên có độ tương đồng token đủ cao rồi
+ * XÁC MINH bằng tên gốc / năm phát hành từ trang chi tiết của ứng viên.
+ * Trả về chi tiết đã xác minh (để không phải tải lại), null khi không tìm được.
+ */
+async function findAlternateByTitle(
   source: HubSource,
   refName: string,
   refOrigin: string | undefined,
+  refYear: string | undefined,
   excludeSlug: string,
-): Promise<string | null> {
-  const keywords = [refName, refOrigin].filter((x): x is string => !!x && x.trim().length > 1);
-  for (const kw of keywords) {
-    const res = await getHubList({ source, page: 1, q: kw, category: "", country: "", year: "" });
-    const hit = res.items.find(
-      (it) =>
-        it.slug !== excludeSlug &&
-        titlesMatch({ name: it.title, originName: it.originName }, refName, refOrigin),
-    );
-    if (hit) return hit.slug;
+): Promise<SourceDetail | null> {
+  const SIMILAR_MIN = 0.5;
+  const keywords = searchKeywordVariants(refName, refOrigin);
+
+  type Candidate = { slug: string; score: number };
+  const seen = new Map<string, Candidate>();
+
+  for (const keyword of keywords) {
+    for (let page = 1; page <= 2; page += 1) {
+      let res: HubListResult;
+      try {
+        res = await getHubList({ source, page, q: keyword, category: "", country: "", year: "" });
+      } catch {
+        break;
+      }
+      if (res.error || res.items.length === 0) break;
+      for (const item of res.items) {
+        if (item.slug === excludeSlug) continue;
+        if (titlesMatch({ name: item.title, originName: item.originName }, refName, refOrigin)) {
+          return await withTimeout(DETAIL_FETCHERS[source](item.slug), 10_000);
+        }
+        const score = Math.max(
+          titleSimilarity(item.title, refName),
+          titleSimilarity(item.title, refOrigin),
+          titleSimilarity(item.originName, refName),
+          titleSimilarity(item.originName, refOrigin),
+        );
+        if (score < SIMILAR_MIN) continue;
+        const existing = seen.get(item.slug);
+        if (!existing || score > existing.score) seen.set(item.slug, { slug: item.slug, score });
+      }
+      if (res.items.length < 18) break;
+    }
+  }
+
+  const ranked = [...seen.values()].sort((a, b) => b.score - a.score).slice(0, 5);
+  for (const candidate of ranked) {
+    try {
+      const detail = await withTimeout(DETAIL_FETCHERS[source](candidate.slug), 10_000);
+      if (!detail.name) continue;
+      const nameSim = Math.max(
+        titleSimilarity(detail.name, refName),
+        titleSimilarity(detail.originName, refName),
+      );
+      const originSim =
+        detail.originName && refOrigin ? titleSimilarity(detail.originName, refOrigin) : 0;
+      // Tên (đã quy số → chữ) giống hệt, hoặc tên gốc giống hệt → chắc chắn đúng.
+      if (nameSim === 1 || originSim === 1) return detail;
+      // Cùng năm phát hành + tên gần giống → đủ tin cậy (loại các phần tiếp theo khác năm).
+      if (
+        refYear &&
+        detail.year &&
+        String(detail.year) === String(refYear) &&
+        nameSim >= 0.6
+      ) {
+        return detail;
+      }
+    } catch {
+      // Ứng viên này không tải được chi tiết — thử ứng viên tiếp theo.
+    }
   }
   return null;
 }
@@ -492,6 +585,7 @@ async function resolveAlternateSource(
   slug: string,
   refName: string,
   refOrigin: string | undefined,
+  refYear: string | undefined,
 ): Promise<HubDetail["bySource"][HubSource]> {
   try {
     const direct = await withTimeout(DETAIL_FETCHERS[source](slug), 12_000);
@@ -503,11 +597,8 @@ async function resolveAlternateSource(
   }
 
   try {
-    const matchedSlug = await findSlugByTitle(source, refName, refOrigin, slug);
-    if (!matchedSlug) return { error: "Không tìm thấy phim phù hợp" };
-
-    const matched = await withTimeout(DETAIL_FETCHERS[source](matchedSlug), 10_000);
-    if (!titlesMatch(matched, refName, refOrigin)) return { error: "Không tìm thấy phim phù hợp" };
+    const matched = await findAlternateByTitle(source, refName, refOrigin, refYear, slug);
+    if (!matched) return { error: "Không tìm thấy phim phù hợp" };
     return toSourceEntry(matched);
   } catch {
     return { error: "Không thể tải nguồn này" };
@@ -523,13 +614,14 @@ export async function getHubDetailAlternates(
   primarySource: HubSource,
   refName: string,
   refOrigin?: string,
+  refYear?: string,
 ): Promise<HubDetail["bySource"]> {
   const sources: HubSource[] = ["nguonc", "kk"];
   const alternates = sources.filter((source) => source !== primarySource);
   const results = await Promise.all(
     alternates.map(async (source) => ({
       source,
-      entry: await resolveAlternateSource(source, slug, refName, refOrigin),
+      entry: await resolveAlternateSource(source, slug, refName, refOrigin, refYear),
     })),
   );
   return Object.fromEntries(results.map(({ source, entry }) => [source, entry])) as HubDetail["bySource"];
