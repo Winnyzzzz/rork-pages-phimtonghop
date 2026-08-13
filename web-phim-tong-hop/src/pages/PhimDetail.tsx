@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { Download, Share2 } from "lucide-react";
+import { Download, Play, Share2 } from "lucide-react";
 
 import DownloadPanel from "@/components/DownloadPanel";
 import { HlsPlayer } from "@/components/HlsPlayer";
@@ -98,6 +98,7 @@ export default function PhimDetail() {
   const epScrollInitRef = useRef<boolean>(false);
   const [entry, setEntry] = useState<{ slug: string; source: HubSource }>({ slug, source: from });
   const [progressiveData, setProgressiveData] = useState<HubDetail | undefined>();
+  const [playRequested, setPlayRequested] = useState<boolean>(false);
 
   // The source clicked on the list is fetched first. Changing servers later must not restart the page.
   useEffect(() => {
@@ -174,6 +175,13 @@ export default function PhimDetail() {
   const servers = hasServers ? active.servers : [];
   const currentServer = servers[server] ?? servers[0];
   const currentEp = currentServer?.episodes[ep] ?? currentServer?.episodes[0];
+
+  // SV KK dùng iframe embed nên khi vào nguồn/chuyển tập, chỉ hiện poster + nút phát
+  // (không tự phát); iframe chỉ được mount sau khi người dùng bấm nút.
+  const embedKey = currentEp?.embed ?? "";
+  useEffect(() => {
+    setPlayRequested(false);
+  }, [embedKey]);
 
   useEffect(() => {
     if (!data || !currentEp) return;
@@ -271,12 +279,40 @@ export default function PhimDetail() {
           <div ref={playerRef} className="mb-4 scroll-mt-14 overflow-hidden rounded-lg bg-black">
             <div className="aspect-video w-full">
               {currentEp?.embed ? (
-                <iframe
-                  src={currentEp.embed}
-                  allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
-                  allowFullScreen
-                  className="h-full w-full"
-                />
+                activeSource === "kk" && !playRequested ? (
+                  <button
+                    type="button"
+                    onClick={() => setPlayRequested(true)}
+                    aria-label="Phát tập phim"
+                    className="relative block h-full w-full cursor-pointer"
+                  >
+                    {data.poster ? (
+                      <img
+                        src={data.poster}
+                        alt=""
+                        className="h-full w-full object-cover opacity-90"
+                        referrerPolicy="no-referrer"
+                      />
+                    ) : (
+                      <span className="absolute inset-0 bg-slate-800" />
+                    )}
+                    <span className="absolute inset-0 flex items-center justify-center bg-black/30 transition hover:bg-black/20">
+                      <span className="flex h-16 w-16 items-center justify-center rounded-full bg-white/95 text-black shadow-xl transition hover:scale-105">
+                        <Play size={28} className="ml-1" fill="currentColor" aria-hidden="true" />
+                      </span>
+                    </span>
+                    <span className="absolute bottom-2 left-3 rounded bg-black/50 px-2 py-0.5 text-xs text-white/90">
+                      Nhấn để phát
+                    </span>
+                  </button>
+                ) : (
+                  <iframe
+                    src={currentEp.embed}
+                    allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
+                    allowFullScreen
+                    className="h-full w-full"
+                  />
+                )
               ) : currentEp?.m3u8 ? (
                 <HlsPlayer src={currentEp.m3u8} poster={data.poster} />
               ) : (
