@@ -1,15 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { Download, Play, Share2 } from "lucide-react";
+import { Download, Share2, X } from "lucide-react";
 
 import DownloadPanel from "@/components/DownloadPanel";
-import { HlsPlayer } from "@/components/HlsPlayer";
+import { HeroStage } from "@/components/detail/HeroStage";
+import { MovieInfo } from "@/components/detail/MovieInfo";
+import { RelatedMovies } from "@/components/detail/RelatedMovies";
 import { toast } from "@/components/ui/sonner";
 import { downloadManager, pickExtension, sanitizeFileName } from "@/lib/downloader";
 import {
   getHubDetailAlternates,
   getHubDetailPrimary,
+  getHubRelated,
   type HubDetail,
   type HubSource,
 } from "@/lib/hub";
@@ -80,6 +83,12 @@ async function shareCurrentUrl(): Promise<void> {
   else toast.error("Không thể sao chép đường dẫn");
 }
 
+/** Chuyển link trailer YouTube thành URL nhúng; link không phải YouTube thì trả null. */
+function toYouTubeEmbed(url: string): string | null {
+  const match = /(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([\w-]{6,})/.exec(url);
+  return match ? `https://www.youtube.com/embed/${match[1]}?autoplay=1` : null;
+}
+
 export default function PhimDetail() {
   const { slug = "" } = useParams<{ slug: string }>();
   const [params, setParams] = useSearchParams();
@@ -99,6 +108,7 @@ export default function PhimDetail() {
   const [entry, setEntry] = useState<{ slug: string; source: HubSource }>({ slug, source: from });
   const [progressiveData, setProgressiveData] = useState<HubDetail | undefined>();
   const [playRequested, setPlayRequested] = useState<boolean>(false);
+  const [trailerOpen, setTrailerOpen] = useState<boolean>(false);
 
   // The source clicked on the list is fetched first. Changing servers later must not restart the page.
   useEffect(() => {
@@ -106,6 +116,10 @@ export default function PhimDetail() {
     setProgressiveData(undefined);
     restoredRef.current = false;
     initialScrollRef.current = false;
+  }, [slug]);
+
+  useEffect(() => {
+    setTrailerOpen(false);
   }, [slug]);
 
   const { data: primaryData, isLoading: isLoadingPrimary, error: primaryError } = useQuery({
@@ -176,7 +190,7 @@ export default function PhimDetail() {
   const currentServer = servers[server] ?? servers[0];
   const currentEp = currentServer?.episodes[ep] ?? currentServer?.episodes[0];
 
-  // SV KK dùng iframe embed nên khi vào nguồn/chuyển tập, chỉ hiện poster + nút phát
+  // SV KK dùng iframe embed nên khi vào nguồn/chuyển tập, chỉ hiện hero + nút phát
   // (không tự phát); iframe chỉ được mount sau khi người dùng bấm nút.
   const embedKey = currentEp?.embed ?? "";
   useEffect(() => {
@@ -191,6 +205,30 @@ export default function PhimDetail() {
     if (!data || !currentEp) return;
     saveWatchMemory("hub", slug, { server, ep, from: activeSource });
   }, [data, currentEp, slug, server, ep, activeSource]);
+
+  // Gợi ý phim tương tự (cùng thể loại / cùng quốc gia) từ KK.
+  const { data: relatedData, isLoading: isLoadingRelated } = useQuery({
+    queryKey: [
+      "hub-related",
+      slug,
+      data?.title,
+      data?.originName,
+      JSON.stringify(data?.categories ?? []),
+      JSON.stringify(data?.countries ?? []),
+    ],
+    queryFn: () =>
+      getHubRelated({
+        excludeSlug: slug,
+        excludeTitles: [data!.title, data!.originName].filter(
+          (value): value is string => typeof value === "string" && value.length > 0,
+        ),
+        categories: data!.categories,
+        countries: data!.countries,
+      }),
+    enabled: !!data,
+    staleTime: 30 * 60_000,
+  });
+  const relatedRows = relatedData?.rows ?? [];
 
   const scrollPlayerIntoView = useCallback((): void => {
     playerRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -246,11 +284,18 @@ export default function PhimDetail() {
     [data],
   );
 
+  const openTrailer = useCallback((): void => {
+    const url = data?.trailerUrl;
+    if (!url) return;
+    if (toYouTubeEmbed(url)) setTrailerOpen(true);
+    else window.open(url, "_blank", "noopener");
+  }, [data?.trailerUrl]);
+
   const backHref = "/";
 
   return (
-    <div className="mx-auto max-w-7xl px-4 py-6">
-      <div className="sticky top-0 z-20 -mx-4 mb-3 flex items-center justify-between gap-2 border-b bg-background/85 px-4 py-2 backdrop-blur">
+    <div className="mx-auto max-w-7xl px-4 pb-10 pt-4">
+      <div className="sticky top-0 z-20 -mx-4 mb-4 flex items-center gap-3 border-b bg-background/85 px-4 py-2 backdrop-blur">
         <Link
           to={backHref}
           onClick={(e) => {
@@ -261,7 +306,12 @@ export default function PhimDetail() {
         >
           ← Về danh sách
         </Link>
-        <div className="flex items-center gap-2">
+        {data && (
+          <span className="hidden min-w-0 flex-1 truncate text-center text-sm font-medium text-muted-foreground sm:block">
+            {data.title}
+          </span>
+        )}
+        <div className="ml-auto flex items-center gap-2">
           <button
             type="button"
             onClick={() => void shareCurrentUrl()}
@@ -280,79 +330,62 @@ export default function PhimDetail() {
 
       {data && (
         <>
-          <div ref={playerRef} className="mb-4 scroll-mt-14 overflow-hidden rounded-lg bg-black">
-            <div className="aspect-video w-full">
-              {currentEp?.embed ? (
-                activeSource === "kk" && !playRequested ? (
-                  <button
-                    type="button"
-                    onClick={() => setPlayRequested(true)}
-                    aria-label="Phát tập phim"
-                    className="relative block h-full w-full cursor-pointer"
-                  >
-                    {data.poster ? (
-                      <img
-                        src={data.poster}
-                        alt=""
-                        className="h-full w-full object-cover opacity-90"
-                        referrerPolicy="no-referrer"
-                      />
-                    ) : (
-                      <span className="absolute inset-0 bg-slate-800" />
-                    )}
-                    <span className="absolute inset-0 flex items-center justify-center bg-black/30 transition hover:bg-black/20">
-                      <span className="flex h-16 w-16 items-center justify-center rounded-full bg-white/95 text-black shadow-xl transition hover:scale-105">
-                        <Play size={28} className="ml-1" fill="currentColor" aria-hidden="true" />
-                      </span>
-                    </span>
-                    <span className="absolute bottom-2 left-3 rounded bg-black/50 px-2 py-0.5 text-xs text-white/90">
-                      Nhấn để phát
-                    </span>
-                  </button>
-                ) : (
-                  <iframe
-                    src={currentEp.embed}
-                    allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
-                    allowFullScreen
-                    className="h-full w-full"
-                  />
-                )
-              ) : currentEp?.m3u8 ? (
-                <HlsPlayer src={currentEp.m3u8} poster={data.poster} />
-              ) : (
-                <div className="flex h-full items-center justify-center text-sm text-white/70">
-                  {currentEp ? "Không có link phát" : "Chưa có tập nào từ nguồn này"}
-                </div>
-              )}
-            </div>
+          <div ref={playerRef} className="scroll-mt-16">
+            <HeroStage
+              data={data}
+              activeSource={activeSource}
+              currentEp={currentEp}
+              playRequested={playRequested}
+              onPlay={() => setPlayRequested(true)}
+            />
           </div>
 
-          <div className="mb-3 flex flex-wrap gap-2">
-            {SOURCES.map((s) => {
-              const meta = SOURCE_META[s];
-              const src = data.bySource[s];
-              const ok = !!src && "servers" in src && src.servers.some((x) => x.episodes.length > 0);
-              const isPending = isLoadingAlternates && s !== entry.source && !src;
-              return (
-                <button
-                  key={s}
-                  disabled={!ok}
-                  onClick={() => nav({ from: s, server: 0, ep: 0 })}
-                  className={`rounded-full px-4 py-1.5 text-sm font-medium transition ${
-                    activeSource === s
-                      ? `${meta.color} text-white shadow`
-                      : ok
-                        ? "border bg-background hover:bg-muted"
-                        : isPending
-                          ? "border bg-muted text-muted-foreground opacity-70"
-                          : "border bg-muted text-muted-foreground line-through opacity-60"
-                  }`}
-                  title={isPending ? "Đang tải nguồn này…" : !ok ? "Nguồn này không có phim" : ""}
-                >
-                  SV {meta.label}{isPending ? "…" : ""}
-                </button>
-              );
-            })}
+          {/* Nguồn phát + server + tải xuống */}
+          <div className="mt-4 flex flex-wrap items-center gap-2">
+            <div className="inline-flex items-center gap-1 rounded-full border bg-muted/40 p-1">
+              {SOURCES.map((s) => {
+                const meta = SOURCE_META[s];
+                const src = data.bySource[s];
+                const ok = !!src && "servers" in src && src.servers.some((x) => x.episodes.length > 0);
+                const isPending = isLoadingAlternates && s !== entry.source && !src;
+                return (
+                  <button
+                    key={s}
+                    disabled={!ok}
+                    onClick={() => nav({ from: s, server: 0, ep: 0 })}
+                    title={isPending ? "Đang tải nguồn này…" : !ok ? "Nguồn này không có phim" : ""}
+                    className={`rounded-full px-3.5 py-1.5 text-sm font-semibold transition ${
+                      activeSource === s
+                        ? `${meta.color} text-white shadow`
+                        : ok
+                          ? "text-muted-foreground hover:text-foreground"
+                          : isPending
+                            ? "text-muted-foreground opacity-70"
+                            : "text-muted-foreground/50 line-through opacity-60"
+                    }`}
+                  >
+                    SV {meta.label}{isPending ? "…" : ""}
+                  </button>
+                );
+              })}
+            </div>
+
+            {servers.length > 1 && (
+              <div className="flex flex-wrap gap-1.5">
+                {servers.map((s, i) => (
+                  <button
+                    key={i}
+                    onClick={() => nav({ server: i, ep: 0 })}
+                    className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                      i === server ? "bg-foreground text-background" : "hover:bg-muted"
+                    }`}
+                  >
+                    {s.name}
+                  </button>
+                ))}
+              </div>
+            )}
+
             <button
               type="button"
               disabled={!dlUrl}
@@ -372,40 +405,38 @@ export default function PhimDetail() {
           </div>
 
           {isLoadingAlternates && (
-            <p className="mb-3 text-xs text-muted-foreground">Đang bổ sung các nguồn còn lại…</p>
+            <p className="mt-2 text-xs text-muted-foreground">Đang bổ sung các nguồn còn lại…</p>
           )}
 
-          {servers.length > 1 && (
-            <div className="mb-3 flex flex-wrap gap-2">
-              {servers.map((s, i) => (
-                <button
-                  key={i}
-                  onClick={() => nav({ server: i, ep: 0 })}
-                  className={`rounded-md px-3 py-1 text-xs ${i === server ? "bg-primary text-primary-foreground" : "border"}`}
-                >
-                  {s.name}
-                </button>
-              ))}
-            </div>
-          )}
+          <MovieInfo
+            data={data}
+            onShare={() => void shareCurrentUrl()}
+            onTrailer={data.trailerUrl ? openTrailer : undefined}
+          />
 
           {currentServer && currentServer.episodes.length > 0 && (
-            <div className="mb-6">
-              <div className="mb-2 text-sm font-medium">
-                Danh sách tập ({currentServer.episodes.length})
+            <section className="mt-8">
+              <div className="mb-3 flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                <h2 className="text-lg font-bold tracking-tight">Danh sách tập</h2>
+                <span className="text-xs text-muted-foreground">
+                  {currentServer.name} · {currentServer.episodes.length} tập
+                  {data.episodeTotal ? ` / ${data.episodeTotal}` : ""}
+                </span>
               </div>
-              <div className="grid grid-cols-4 gap-1.5 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-10">
+              <div className="grid grid-cols-4 gap-2 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-10">
                 {currentServer.episodes.map((e, i) => (
                   <div
                     key={i}
-                    className={`flex items-stretch overflow-hidden rounded-md border ${
-                      i === ep ? "border-primary bg-primary text-primary-foreground" : "hover:bg-muted"
+                    className={`group flex items-stretch overflow-hidden rounded-lg border transition ${
+                      i === ep
+                        ? "border-primary bg-primary text-primary-foreground shadow-md"
+                        : "hover:border-primary/50 hover:bg-muted"
                     }`}
                   >
                     <button
                       ref={i === ep ? activeEpRef : undefined}
                       onClick={() => nav({ ep: i })}
-                      className="min-w-0 flex-1 px-2 py-1.5 text-xs"
+                      className="min-w-0 flex-1 px-2 py-2 text-xs font-medium"
                     >
                       {e.name}
                     </button>
@@ -414,37 +445,60 @@ export default function PhimDetail() {
                         onClick={() => startDownload(e.name || `Tập ${i + 1}`, e.m3u8 || e.embed)}
                         aria-label={`Tải ${e.name}`}
                         title={`Tải ${e.name}`}
-                        className="px-1.5 opacity-70 transition hover:opacity-100"
+                        className={`px-2 transition ${
+                          i === ep
+                            ? "opacity-80 hover:opacity-100"
+                            : "text-muted-foreground opacity-60 hover:text-foreground hover:opacity-100"
+                        }`}
                       >
-                        <Download size={12} aria-hidden="true" />
+                        <Download size={13} aria-hidden="true" />
                       </button>
                     )}
                   </div>
                 ))}
               </div>
-            </div>
+            </section>
           )}
 
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-[180px_1fr]">
-            {data.poster && (
-              <img
-                src={data.poster}
-                alt={data.title}
-                className="w-full max-w-[180px] rounded-md"
-                referrerPolicy="no-referrer"
-              />
-            )}
-            <div>
-              <h1 className="text-2xl font-bold">{data.title}</h1>
-              {data.originName && <p className="text-sm text-muted-foreground">{data.originName}</p>}
-              <div className="mt-2 flex flex-wrap gap-2 text-xs">
-                {data.year && <span className="rounded bg-muted px-2 py-0.5">{data.year}</span>}
-                {data.country && <span className="rounded bg-muted px-2 py-0.5">{data.country}</span>}
-                {data.category && <span className="rounded bg-muted px-2 py-0.5">{data.category}</span>}
+          <RelatedMovies rows={relatedRows} loading={isLoadingRelated} />
+
+          {trailerOpen && data.trailerUrl && (
+            <div
+              className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
+              role="dialog"
+              aria-modal="true"
+              aria-label={`Trailer ${data.title}`}
+              onClick={() => setTrailerOpen(false)}
+            >
+              <div
+                className="w-full max-w-3xl overflow-hidden rounded-xl bg-black shadow-2xl"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="flex items-center justify-between px-4 py-2.5">
+                  <span className="truncate pr-3 text-sm font-medium text-white/80">
+                    Trailer — {data.title}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setTrailerOpen(false)}
+                    aria-label="Đóng trailer"
+                    className="inline-flex min-h-9 min-w-9 shrink-0 items-center justify-center rounded-md text-white/70 transition hover:bg-white/10 hover:text-white"
+                  >
+                    <X size={16} aria-hidden="true" />
+                  </button>
+                </div>
+                <div className="aspect-video">
+                  <iframe
+                    src={toYouTubeEmbed(data.trailerUrl) ?? data.trailerUrl}
+                    title={`Trailer ${data.title}`}
+                    allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+                    allowFullScreen
+                    className="h-full w-full"
+                  />
+                </div>
               </div>
-              {data.description && <p className="mt-3 text-sm leading-relaxed">{data.description}</p>}
             </div>
-          </div>
+          )}
         </>
       )}
 

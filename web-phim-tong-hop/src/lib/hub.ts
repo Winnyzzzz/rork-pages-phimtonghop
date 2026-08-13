@@ -18,21 +18,40 @@ export type HubItem = {
   epLabel?: string;
 };
 
+export type HubEpisode = { name: string; embed: string; m3u8: string };
+
 export type HubServer = {
   name: string;
-  episodes: { name: string; embed: string; m3u8: string }[];
+  episodes: HubEpisode[];
 };
+
+/** Tên + slug của một thể loại / quốc gia (để gợi ý phim tương tự). */
+export type HubTag = { name: string; slug?: string };
 
 export type HubDetail = {
   slug: string;
   title: string;
   originName?: string;
   poster: string;
+  /** Ảnh ngang (backdrop) để làm nền hero; nguồn không có thì hero dùng poster mờ. */
+  backdrop?: string;
   description: string;
   year?: string;
-  country?: string;
-  category?: string;
   time?: string;
+  quality?: string;
+  lang?: string;
+  /** Trạng thái phát hành, vd "ongoing" / "completed" (KK). */
+  status?: string;
+  /** Loại phim, vd "series" / "single" (KK). */
+  type?: string;
+  episodeCurrent?: string;
+  episodeTotal?: string;
+  viewCount?: number;
+  trailerUrl?: string;
+  actors?: string[];
+  director?: string[];
+  categories?: HubTag[];
+  countries?: HubTag[];
   bySource: Partial<Record<HubSource, { name: string; servers: HubServer[] } | { error: string }>>;
 };
 
@@ -245,11 +264,22 @@ type SourceDetail = {
   name: string;
   originName?: string;
   poster: string;
+  backdrop?: string;
   description: string;
   year?: string;
-  country?: string;
-  category?: string;
   time?: string;
+  quality?: string;
+  lang?: string;
+  status?: string;
+  type?: string;
+  episodeCurrent?: string;
+  episodeTotal?: string;
+  viewCount?: number;
+  trailerUrl?: string;
+  actors?: string[];
+  director?: string[];
+  categories?: HubTag[];
+  countries?: HubTag[];
   servers: HubServer[];
 };
 
@@ -270,8 +300,8 @@ async function fetchNguoncDetail(slug: string): Promise<SourceDetail> {
     poster: movie.poster_url || movie.thumb_url || "",
     description: (movie.description || "").replace(/<[^>]+>/g, ""),
     year: movie.category?.["3"]?.list?.[0]?.name,
-    country: movie.category?.["4"]?.list?.map((x: any) => x.name).join(", "),
-    category: movie.category?.["2"]?.list?.map((x: any) => x.name).join(", "),
+    categories: (movie.category?.["2"]?.list ?? []).map((x: any) => ({ name: x.name, slug: x.id })),
+    countries: (movie.category?.["4"]?.list ?? []).map((x: any) => ({ name: x.name, slug: x.id })),
     time: movie.episode_time || movie.time || undefined,
     servers,
   };
@@ -289,15 +319,31 @@ async function fetchKkDetail(slug: string): Promise<SourceDetail> {
       m3u8: it.link_m3u8 || "",
     })),
   }));
+  const views = Number(movie.view);
+  const cleanNames = (value: unknown): string[] | undefined =>
+    Array.isArray(value)
+      ? value.filter((x): x is string => typeof x === "string" && x.trim().length > 0 && x !== "Đang cập nhật")
+      : undefined;
   return {
     name: movie.name,
     originName: movie.origin_name,
     poster: posterKK(movie.poster_url || movie.thumb_url),
+    backdrop: posterKK(movie.thumb_url),
     description: (movie.content || "").replace(/<[^>]+>/g, ""),
     year: movie.year ? String(movie.year) : undefined,
-    country: (movie.country ?? []).map((x: any) => x.name).join(", "),
-    category: (movie.category ?? []).map((x: any) => x.name).join(", "),
     time: movie.time ? String(movie.time) : undefined,
+    quality: movie.quality ? String(movie.quality) : undefined,
+    lang: movie.lang ? String(movie.lang) : undefined,
+    status: movie.status ? String(movie.status) : undefined,
+    type: movie.type ? String(movie.type) : undefined,
+    episodeCurrent: movie.episode_current ? String(movie.episode_current) : undefined,
+    episodeTotal: movie.episode_total ? String(movie.episode_total) : undefined,
+    viewCount: Number.isFinite(views) && views > 0 ? views : undefined,
+    trailerUrl: typeof movie.trailer_url === "string" && movie.trailer_url.length > 0 ? movie.trailer_url : undefined,
+    actors: cleanNames(movie.actor),
+    director: cleanNames(movie.director),
+    categories: (movie.category ?? []).map((x: any) => ({ name: x.name, slug: x.slug })),
+    countries: (movie.country ?? []).map((x: any) => ({ name: x.name, slug: x.slug })),
     servers,
   };
 }
@@ -398,11 +444,22 @@ function toPrimaryDetail(slug: string, source: HubSource, detail: SourceDetail):
     title: detail.name || slug,
     originName: detail.originName,
     poster: detail.poster,
+    backdrop: detail.backdrop,
     description: detail.description,
     year: detail.year,
-    country: detail.country,
-    category: detail.category,
     time: detail.time,
+    quality: detail.quality,
+    lang: detail.lang,
+    status: detail.status,
+    type: detail.type,
+    episodeCurrent: detail.episodeCurrent,
+    episodeTotal: detail.episodeTotal,
+    viewCount: detail.viewCount,
+    trailerUrl: detail.trailerUrl,
+    actors: detail.actors,
+    director: detail.director,
+    categories: detail.categories,
+    countries: detail.countries,
     bySource: { [source]: toSourceEntry(detail) },
   };
 }
@@ -460,4 +517,112 @@ export async function getHubDetailAlternates(
     })),
   );
   return Object.fromEntries(results.map(({ source, entry }) => [source, entry])) as HubDetail["bySource"];
+}
+
+/** Chuyển tên hiển thị (vd "Hành Động") thành slug kiểu KK ("hanh-dong"). */
+export function deriveSlug(name: string): string {
+  return name
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\u0111/g, "d")
+    .replace(/\u0110/g, "D")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+export type RelatedRow = {
+  key: string;
+  title: string;
+  subtitle?: string;
+  items: HubItem[];
+};
+
+export type HubRelated = { rows: RelatedRow[] };
+
+/** Thể loại dạng "định dạng phim" — quá rộng để gợi ý phim tương tự. */
+const FORMAT_CATEGORIES = new Set(["phim bo", "phim le"]);
+
+/**
+ * Gợi ý phim tương tự dựa trên thể loại và quốc gia của phim đang xem.
+ * Luôn lấy từ KK (nguồn có danh sách thể loại/quốc gia đầy đủ); nếu KK lỗi thì trả về rỗng.
+ */
+export async function getHubRelated(opts: {
+  excludeSlug: string;
+  excludeTitles: string[];
+  categories?: HubTag[];
+  countries?: HubTag[];
+  limit?: number;
+}): Promise<HubRelated> {
+  const limit = opts.limit ?? 12;
+  const rows: RelatedRow[] = [];
+
+  const isExcluded = (item: HubItem): boolean => {
+    if (item.slug === opts.excludeSlug) return true;
+    const names = [item.title, item.originName].filter((x): x is string => !!x);
+    return names.some((name) => opts.excludeTitles.some((title) => titlesEquivalent(name, title)));
+  };
+
+  const loadKk = async (patch: Pick<HubListParams, "category" | "country">): Promise<HubItem[]> => {
+    try {
+      const result = await getHubList({ source: "kk", page: 1, q: "", ...patch, year: "" });
+      if (result.items.length === 0) return [];
+      const seen = new Set<string>();
+      const out: HubItem[] = [];
+      for (const item of result.items) {
+        if (seen.has(item.slug) || isExcluded(item)) continue;
+        seen.add(item.slug);
+        out.push(item);
+        if (out.length >= limit) break;
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  };
+
+  const resolveSlug = (tag: HubTag): string | undefined => tag.slug || (tag.name ? deriveSlug(tag.name) : undefined);
+
+  // Hàng "cùng thể loại": ưu tiên thể loại nội dung (bỏ qua Phim Bộ / Phim Lẻ), tối đa 2 thể loại.
+  const genreCandidates = (opts.categories ?? []).filter(
+    (c) => !FORMAT_CATEGORIES.has(normalizeTitle(c.name)),
+  );
+  const catCandidates = genreCandidates.length > 0 ? genreCandidates : (opts.categories ?? []);
+  const catSlugs = [...new Set(catCandidates.map(resolveSlug).filter((x): x is string => !!x))].slice(0, 2);
+  const catBatches = await Promise.all(catSlugs.map((slug) => loadKk({ category: slug, country: "" })));
+  const catItems: HubItem[] = [];
+  const catSeen = new Set<string>();
+  for (const batch of catBatches) {
+    for (const item of batch) {
+      if (catSeen.has(item.slug)) continue;
+      catSeen.add(item.slug);
+      catItems.push(item);
+    }
+  }
+  if (catItems.length > 0) {
+    rows.push({
+      key: "category",
+      title: "Phim cùng thể loại",
+      subtitle: catCandidates.slice(0, 2).map((c) => c.name).join(" · "),
+      items: catItems.slice(0, limit),
+    });
+  }
+
+  // Hàng "cùng quốc gia".
+  const countrySlug = resolveSlug(opts.countries?.[0] ?? { name: "" });
+  if (countrySlug) {
+    const countryItems = (await loadKk({ category: "", country: countrySlug })).filter(
+      (item) => !catSeen.has(item.slug),
+    );
+    if (countryItems.length > 0) {
+      rows.push({
+        key: "country",
+        title: "Phim cùng quốc gia",
+        subtitle: opts.countries?.[0]?.name,
+        items: countryItems.slice(0, limit),
+      });
+    }
+  }
+
+  return { rows };
 }
