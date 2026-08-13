@@ -133,7 +133,10 @@ async function resolveEmbedViaApi(url: string, signal?: AbortSignal): Promise<Em
       headers: { "x-dl-key": DL_KEY },
       signal,
     });
-    if (!res.ok) return null;
+    const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
+    // Preview chưa route function sẽ trả SPA HTML — không coi là lỗi cứng,
+    // client vẫn còn đường dò qua proxy /download/.
+    if (!contentType.includes("json")) return null;
     const data = (await res.json()) as {
       kind?: string;
       url?: string;
@@ -151,7 +154,7 @@ async function resolveEmbedViaApi(url: string, signal?: AbortSignal): Promise<Em
       return { url: "", error: data.message };
     }
   } catch {
-    // function không khả dụng (preview) — bỏ qua, luồng cũ vẫn chạy
+    // function không khả dụng — vẫn còn dò qua proxy /download/
   }
   return null;
 }
@@ -539,6 +542,69 @@ function decodeBase64UrlText(value: string): string | null {
   return null;
 }
 
+type EmbedCandidates = { iframes: string[]; media: string[]; api: string[] };
+
+type ProbeChunk = {
+  ok: boolean;
+  finalUrl: string;
+  status: number;
+  type: string;
+  head: Uint8Array;
+};
+
+/**
+ * Soạn thông báo lỗi chi tiết từ vết dò embed: 403 = trang nhúng chặn IP máy
+ * chủ dò, lỗi mạng = không kết nối được, còn lại = không thấy luồng.
+ */
+function embedProbeFailureMessage(trail: { url: string; status: number }[]): string {
+  const any403 = trail.some((hop) => hop.status === 403);
+  const anyNetErr = trail.some((hop) => hop.status === 0);
+  if (any403) return "Trang nhúng chặn máy chủ dò (HTTP 403) — hãy thử nguồn khác";
+  if (anyNetErr) return "Không kết nối được trang nhúng — kiểm tra mạng hoặc thử nguồn khác";
+  return "Không tìm thấy luồng video trong link nhúng";
+}
+
+
+/**
+ * Lọc các URL đáng chú ý trong HTML trang embed/player: iframe, link media
+ * (.m3u8/.mp4), player/?url= (base64) và mẫu encryptedURL → conf.php.
+ */
+function extractEmbedCandidates(html: string, baseUrl: string): EmbedCandidates {
+  const toAbs = (candidate: string): string | null => {
+    if (!candidate) return null;
+    try {
+      return new URL(candidate, baseUrl).href;
+    } catch {
+      return null;
+    }
+  };
+  const uniquePush = (list: string[], value: string | null): void => {
+    if (value && !list.includes(value)) list.push(value);
+  };
+
+  const iframes: string[] = [];
+  const media: string[] = [];
+  const api: string[] = [];
+
+  for (const m of html.matchAll(/<iframe[^>]+?src=["']([^"']+)["']/gi)) {
+    uniquePush(iframes, toAbs(m[1]));
+  }
+  for (const m of html.matchAll(/["']((?:https?:)?\/\/[^"'\\\s]+?\.(?:m3u8|mp4)(?:\?[^"'\\\s]*)?)["']/gi)) {
+    uniquePush(media, toAbs(m[1].replace(/^\/\//, "https://")));
+  }
+  for (const m of html.matchAll(/\/player\/\?url=([^&"']+)/gi)) {
+    uniquePush(api, decodeBase64UrlText(m[1]));
+  }
+  const encrypted = html.match(/(?<=encryptedURL\s*=\s*").*(?=")/)?.[0];
+  if (encrypted) {
+    uniquePush(api, toAbs(`conf.php?url=${encodeURIComponent(encrypted)}`));
+  }
+  for (const m of html.matchAll(/(?:streamURL|file|source|url)\s*["']?\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/gi)) {
+    uniquePush(api, toAbs(m[1]));
+  }
+  return { iframes, media, api };
+}
+
 class DownloadManager {
   private tasks: TaskInternal[] = [];
   private snapshot: DownloadTask[] = [];
@@ -682,6 +748,156 @@ class DownloadManager {
     if (range) directHeaders.range = `bytes=${range.offset}-${range.offset + range.length - 1}`;
     const direct = await fetch(url, { signal: task.abort.signal, headers: directHeaders });
     return { res: direct, finalUrl: direct.url || url };
+  }
+
+  /**
+   * Đọc phần đầu của một URL qua proxy /download/ (kèm referer), tối đa `limit`
+   * byte — đủ để nhận dạng playlist/trang HTML mà không kéo nguyên file video.
+   */
+  private async fetchProbeChunk(
+    task: TaskInternal,
+    url: string,
+    referer: string | undefined,
+    limit = 400 * 1024,
+  ): Promise<ProbeChunk> {
+    let host = "";
+    try {
+      host = new URL(url).hostname;
+    } catch {
+      // host rỗng → tải trực tiếp
+    }
+
+    let res: Response;
+    let finalUrl = url;
+    let proxied: Response | null = null;
+    if (host && !this.proxyDeadHosts.has(host)) {
+      const headers: Record<string, string> = { "x-dl-key": DL_KEY };
+      if (referer) headers["x-dl-referer"] = referer;
+      try {
+        proxied = await fetch(proxyUrlFor(url), { signal: task.abort.signal, headers });
+      } catch {
+        proxied = null;
+      }
+      if (proxied) finalUrl = proxied.headers.get("x-final-url") || url;
+      if (proxied && !proxied.ok) {
+        // Thử tải trực tiếp (trang có CORS mở vẫn đọc được); không được thì báo
+        // lỗi proxy để luồng gọi biết nguyên nhân (403 chặn IP máy chủ…).
+        this.proxyDeadHosts.add(host);
+        try {
+          res = await fetch(url, { signal: task.abort.signal });
+          finalUrl = res.url || url;
+        } catch {
+          return {
+            ok: false,
+            finalUrl,
+            status: proxied.status,
+            type: proxied.headers.get("content-type") ?? "",
+            head: new Uint8Array(),
+          };
+        }
+      } else {
+        res = proxied ?? (await fetch(url, { signal: task.abort.signal }));
+        if (!proxied) finalUrl = res.url || url;
+      }
+    } else {
+      res = await fetch(url, { signal: task.abort.signal });
+      finalUrl = res.url || url;
+    }
+
+    const type = (res.headers.get("content-type") ?? "").toLowerCase();
+    if (!res.body) return { ok: res.ok, finalUrl, status: res.status, type, head: new Uint8Array() };
+
+    const reader = res.body.getReader();
+    const first = await reader.read();
+    if (first.done || !first.value) {
+      return { ok: res.ok, finalUrl, status: res.status, type, head: new Uint8Array() };
+    }
+    const head = first.value;
+    const sniff = new TextDecoder()
+      .decode(head.subarray(0, Math.min(head.length, 512)))
+      .trimStart();
+    const looksPage =
+      sniff.startsWith("<") ||
+      sniff.startsWith("{") ||
+      sniff.startsWith("#EXTM3U") ||
+      type.includes("html") ||
+      type.includes("json");
+    let all = head;
+    if (looksPage && head.length < limit) {
+      const chunks: Uint8Array[] = [head];
+      let total = head.length;
+      for (;;) {
+        if (task.abort.signal.aborted) throw new DOMException("Aborted", "AbortError");
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.length) {
+          chunks.push(value);
+          total += value.length;
+          if (total >= limit) break;
+        }
+      }
+      if (total > head.length) {
+        all = new Uint8Array(total);
+        let offset = 0;
+        for (const chunk of chunks) {
+          all.set(chunk, offset);
+          offset += chunk.length;
+        }
+      }
+    }
+    void reader.cancel().catch(() => undefined);
+    return { ok: res.ok, finalUrl, status: res.status, type, head: all };
+  }
+
+  /**
+   * Dò đệ quy trang embed qua proxy /download/: tải trang, lọc iframe/player/
+   * link media rồi lần theo tới khi thấy luồng. `preloaded` cho phép dùng lại
+   * HTML đã tải ở bước trước (khỏi tải lại trang gốc).
+   */
+  private async probeEmbed(
+    task: TaskInternal,
+    url: string,
+    referer: string | undefined,
+    depth: number,
+    trail: { url: string; status: number }[],
+    preloaded?: { html: string; finalUrl: string },
+  ): Promise<EmbedResolve> {
+    if (depth > RESOLVE_MAX_DEPTH) return null;
+
+    let html: string;
+    let finalUrl: string;
+    if (preloaded) {
+      html = preloaded.html;
+      finalUrl = preloaded.finalUrl;
+    } else {
+      const chunk = await this.fetchProbeChunk(task, url, referer);
+      trail.push({ url, status: chunk.status });
+      if (!chunk.ok || !chunk.head.length) return null;
+      const sniff = new TextDecoder()
+        .decode(chunk.head.subarray(0, Math.min(chunk.head.length, 512)))
+        .trimStart();
+      if (sniff.startsWith("#EXTM3U")) return { url: chunk.finalUrl, referer };
+      if (chunk.type.startsWith("video/") || chunk.type.startsWith("audio/")) {
+        return { url: chunk.finalUrl, referer };
+      }
+      if (!(sniff.startsWith("<") || sniff.startsWith("{") || chunk.type.includes("html") || chunk.type.includes("json"))) {
+        // Dữ liệu nhị phân không rõ — giao thẳng cho trình tải tự nhận dạng.
+        return { url: chunk.finalUrl, referer };
+      }
+      html = new TextDecoder().decode(chunk.head);
+      finalUrl = chunk.finalUrl;
+    }
+
+    const { iframes, media, api } = extractEmbedCandidates(html, finalUrl);
+    // Link media lộ ngay trong trang: trả thẳng — bước tải sau sẽ kiểm chứng.
+    for (const link of media) {
+      return { url: link, referer: finalUrl };
+    }
+    for (const link of [...api, ...iframes]) {
+      const found = await this.probeEmbed(task, link, finalUrl, depth + 1, trail);
+      if (found) return found;
+    }
+    return null;
   }
 
   private updateSpeed(task: TaskInternal): void {
@@ -849,14 +1065,28 @@ class DownloadManager {
       if (resolved && resolved !== url && depth < RESOLVE_MAX_DEPTH) {
         return this.resolveSourceForWebView(task, resolved, depth + 1);
       }
-      // Link nhúng không lộ luồng trong HTML — nhờ function lần theo iframe/player.
+      // Link nhúng không lộ luồng trong HTML — dò đệ quy qua proxy /download/
+      // trước, rồi mới thử /nc-api/resolve.
+      const trail: { url: string; status: number }[] = [];
+      const probed = await this.probeEmbed(
+        task,
+        url,
+        task.resolveReferer ?? siteRefererFor(url),
+        0,
+        trail,
+        { html, finalUrl },
+      );
+      if (probed?.url) {
+        if (/\.m3u8($|\?)/i.test(probed.url)) return { kind: "hls", url: probed.url };
+        return { kind: "direct", url: probed.url };
+      }
       const viaApi = await resolveEmbedViaApi(url, task.abort.signal);
       if (viaApi?.url) {
         if (/\.m3u8($|\?)/i.test(viaApi.url)) return { kind: "hls", url: viaApi.url };
         return { kind: "direct", url: viaApi.url };
       }
       if (viaApi?.error) throw new Error(`Không dò được luồng trong link nhúng: ${viaApi.error}`);
-      throw new Error("Không tìm thấy luồng video trong link nhúng");
+      throw new Error(embedProbeFailureMessage(trail));
     }
 
     // File nhị phân (mp4/ts trực tiếp) — trình duyệt tải thẳng được.
@@ -929,15 +1159,33 @@ class DownloadManager {
       const html = concatText(await readRest());
       let resolved = extractNguoncStreamUrl(html, finalUrl);
       if (!resolved) {
-        // Link nhúng (embed) — luồng ẩn trong iframe/player: dùng function dò giúp.
+        // Link nhúng (embed) — luồng ẩn trong iframe/player: dò đệ quy qua proxy
+        // /download/ trước (đường này chạy được cả khi function chưa deploy),
+        // rồi mới thử /nc-api/resolve như đường phụ.
         task.message = "Đang dò luồng trong link nhúng…";
         this.emit();
-        const viaApi = await resolveEmbedViaApi(task.sourceUrl, task.abort.signal);
-        if (viaApi?.url) {
-          resolved = viaApi.url;
-          task.resolveReferer = viaApi.referer;
-        } else if (viaApi?.error) {
-          throw new Error(`Không dò được luồng trong link nhúng: ${viaApi.error}`);
+        const trail: { url: string; status: number }[] = [];
+        const probed = await this.probeEmbed(
+          task,
+          task.sourceUrl,
+          task.resolveReferer ?? siteRefererFor(task.sourceUrl),
+          0,
+          trail,
+          { html, finalUrl },
+        );
+        if (probed?.url) {
+          resolved = probed.url;
+          task.resolveReferer = probed.referer;
+        } else {
+          const viaApi = await resolveEmbedViaApi(task.sourceUrl, task.abort.signal);
+          if (viaApi?.url) {
+            resolved = viaApi.url;
+            task.resolveReferer = viaApi.referer;
+          } else if (viaApi?.error) {
+            throw new Error(`Không dò được luồng trong link nhúng: ${viaApi.error}`);
+          } else {
+            throw new Error(embedProbeFailureMessage(trail));
+          }
         }
       }
       if (resolved && resolved !== task.sourceUrl && depth < RESOLVE_MAX_DEPTH) {
