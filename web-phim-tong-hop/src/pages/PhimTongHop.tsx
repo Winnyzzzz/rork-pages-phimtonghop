@@ -179,6 +179,9 @@ export default function PhimTongHop() {
             goto({ q: "", category: "", country: "", year: "", page: 1 });
           }, 700);
         }
+      } else if (value.trim().length >= 2) {
+        // Mở dropdown ngay khi gõ — không chờ focus lại input.
+        setSuggestOpen(true);
       }
     },
     [goto, q],
