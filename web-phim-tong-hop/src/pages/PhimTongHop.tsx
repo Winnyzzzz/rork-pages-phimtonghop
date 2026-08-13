@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { Heart, MapPin, SlidersHorizontal, Tags, X } from "lucide-react";
+import { Heart, Loader2, MapPin, SlidersHorizontal, Tags, X } from "lucide-react";
 
 import {
   getHubFilters,
@@ -76,6 +76,28 @@ export default function PhimTongHop() {
   const restoredRef = useRef<boolean>(false);
   const searchResetTimerRef = useRef<number | undefined>(undefined);
 
+  // Gợi ý nhanh khi gõ: từ khóa được debounce 300ms rồi gọi tìm kiếm trang 1
+  // của nguồn đang chọn — hiện dropdown ngay dưới ô nhập, không cần bấm Tìm.
+  const [suggestQ, setSuggestQ] = useState<string>("");
+  const [suggestOpen, setSuggestOpen] = useState<boolean>(false);
+  const [activeSuggestion, setActiveSuggestion] = useState<number>(-1);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setSuggestQ(qInput.trim()), 300);
+    return () => window.clearTimeout(timer);
+  }, [qInput]);
+
+  const { data: suggestData, isFetching: isFetchingSuggest } = useQuery({
+    queryKey: ["hub-suggest", source, suggestQ],
+    queryFn: () =>
+      getHubList({ source, page: 1, q: suggestQ, category: "", country: "", year: "" }),
+    enabled: suggestQ.length >= 2,
+    staleTime: 5 * 60_000,
+    placeholderData: keepPreviousData,
+  });
+  const suggestItems: HubItem[] = (suggestData?.items ?? []).slice(0, 8);
+  const typingInProgress = qInput.trim() !== suggestQ;
+
   const { data: filters, isLoading: isLoadingFilters } = useQuery({
     queryKey: ["hub-filters"],
     queryFn: () => getHubFilters(),
@@ -148,11 +170,15 @@ export default function PhimTongHop() {
   const onSearchInput = useCallback(
     (value: string): void => {
       setQInput(value);
+      setActiveSuggestion(-1);
       window.clearTimeout(searchResetTimerRef.current);
-      if (value.trim() === "" && q) {
-        searchResetTimerRef.current = window.setTimeout(() => {
-          goto({ q: "", category: "", country: "", year: "", page: 1 });
-        }, 700);
+      if (value.trim() === "") {
+        setSuggestOpen(false);
+        if (q) {
+          searchResetTimerRef.current = window.setTimeout(() => {
+            goto({ q: "", category: "", country: "", year: "", page: 1 });
+          }, 700);
+        }
       }
     },
     [goto, q],
@@ -205,6 +231,28 @@ export default function PhimTongHop() {
             <input
               value={qInput}
               onChange={(e) => onSearchInput(e.target.value)}
+              onFocus={() => {
+                if (qInput.trim().length >= 2) setSuggestOpen(true);
+              }}
+              onBlur={() => window.setTimeout(() => setSuggestOpen(false), 120)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  setSuggestOpen(false);
+                  return;
+                }
+                if (!suggestOpen) return;
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  setActiveSuggestion((i) => Math.min(i + 1, suggestItems.length - 1));
+                } else if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  setActiveSuggestion((i) => Math.max(i - 1, 0));
+                } else if (e.key === "Enter" && activeSuggestion >= 0 && suggestItems[activeSuggestion]) {
+                  e.preventDefault();
+                  setSuggestOpen(false);
+                  openDetail(suggestItems[activeSuggestion]);
+                }
+              }}
               placeholder="Tìm phim…"
               className="w-full rounded-md border bg-background px-3 py-2 pr-9 text-sm"
             />
@@ -218,6 +266,80 @@ export default function PhimTongHop() {
               >
                 <X size={14} aria-hidden="true" />
               </button>
+            )}
+
+            {suggestOpen && qInput.trim().length >= 2 && (
+              <div
+                role="listbox"
+                aria-label="Gợi ý tìm kiếm"
+                onMouseDown={(e) => e.preventDefault()}
+                className="absolute right-0 top-full z-50 mt-1 max-h-96 w-80 overflow-y-auto rounded-md border bg-background p-1 shadow-lg sm:w-96"
+              >
+                {typingInProgress || isFetchingSuggest ? (
+                  <div className="flex items-center gap-2 px-3 py-2.5 text-xs text-muted-foreground">
+                    <Loader2 size={13} className="animate-spin" aria-hidden="true" />
+                    Đang tìm…
+                  </div>
+                ) : suggestItems.length === 0 ? (
+                  <div className="px-3 py-2.5 text-xs text-muted-foreground">
+                    Không tìm thấy phim phù hợp
+                  </div>
+                ) : (
+                  suggestItems.map((item, index) => {
+                    const availableSources = item.availableSources ?? [item.source];
+                    return (
+                      <button
+                        key={`${item.source}:${item.slug}`}
+                        type="button"
+                        role="option"
+                        aria-selected={index === activeSuggestion}
+                        onClick={() => {
+                          setSuggestOpen(false);
+                          openDetail(item);
+                        }}
+                        onMouseEnter={() => setActiveSuggestion(index)}
+                        className={`flex w-full items-center gap-2.5 rounded px-2 py-1.5 text-left transition ${
+                          index === activeSuggestion ? "bg-muted" : ""
+                        }`}
+                      >
+                        <div className="h-12 w-8 shrink-0 overflow-hidden rounded bg-muted">
+                          {item.poster && (
+                            <img
+                              src={item.poster}
+                              alt=""
+                              loading="lazy"
+                              referrerPolicy="no-referrer"
+                              className="h-full w-full object-cover"
+                            />
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-sm font-medium">{item.title}</div>
+                          {item.originName && (
+                            <div className="truncate text-xs text-muted-foreground">{item.originName}</div>
+                          )}
+                        </div>
+                        <div className="flex shrink-0 flex-col items-end gap-1">
+                          {item.year && <span className="text-[10px] text-muted-foreground">{item.year}</span>}
+                          <div className="flex gap-1">
+                            {availableSources.map((availableSource) => (
+                              <span
+                                key={availableSource}
+                                className="rounded bg-muted px-1 py-px text-[9px] font-semibold text-muted-foreground"
+                              >
+                                {SOURCE_LABEL[availableSource]}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })
+                )}
+                <div className="border-t px-3 py-2 text-[11px] text-muted-foreground">
+                  Nhấn Enter để xem tất cả kết quả
+                </div>
+              </div>
             )}
           </div>
           <button className="rounded-md border px-3 py-2 text-sm">Tìm</button>
