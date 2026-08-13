@@ -72,3 +72,35 @@ export function clearListPosition(scope: string): void {
   delete store[scope];
   writeStore(window.sessionStorage, LIST_KEY, store);
 }
+
+// Trạng thái danh sách (tab nguồn, trang, tìm kiếm, bộ lọc) lưu 1 bản duy nhất
+// trong sessionStorage để giữ URL ngắn gọn: /phim/<slug>?from=<nguồn> là đủ.
+export type ListState = {
+  source: string;
+  page: number;
+  q: string;
+  category: string;
+  country: string;
+  year: string;
+};
+
+const LIST_STATE_KEY = "list-state:v1";
+
+export function saveListState(state: ListState): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(LIST_STATE_KEY, JSON.stringify(state));
+  } catch {
+    // ignore quota / privacy errors
+  }
+}
+
+export function readListState(): ListState | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(LIST_STATE_KEY);
+    return raw ? (JSON.parse(raw) as ListState) : null;
+  } catch {
+    return null;
+  }
+}

@@ -7,7 +7,6 @@ import {
   getHubDetailAlternates,
   getHubDetailPrimary,
   type HubDetail,
-  type HubFeedSource,
   type HubSource,
 } from "@/lib/hub";
 import { getWatchMemory, saveWatchMemory } from "@/lib/watch-memory";
@@ -23,12 +22,6 @@ function toSource(v: string | null, fallback: HubSource = "nguonc"): HubSource {
   return v && (SOURCES as string[]).includes(v) ? (v as HubSource) : fallback;
 }
 
-function toFeedSource(v: string | null): HubFeedSource {
-  return v === "all" || (v !== null && (SOURCES as string[]).includes(v))
-    ? (v as HubFeedSource)
-    : "all";
-}
-
 function toInt(v: string | null, min: number, fallback: number): number {
   const n = Number(v);
   return Number.isFinite(n) ? Math.max(min, Math.trunc(n)) : fallback;
@@ -42,12 +35,6 @@ export default function PhimDetail() {
   const from = toSource(params.get("from"));
   const server = toInt(params.get("server"), 0, 0);
   const ep = toInt(params.get("ep"), 0, 0);
-  const back = toInt(params.get("back"), 1, 1);
-  const q = params.get("q") ?? "";
-  const category = params.get("category") ?? "";
-  const country = params.get("country") ?? "";
-  const year = params.get("year") ?? "";
-  const source = toFeedSource(params.get("source"));
 
   const playerRef = useRef<HTMLDivElement>(null);
   const activeEpRef = useRef<HTMLButtonElement>(null);
@@ -104,17 +91,11 @@ export default function PhimDetail() {
           from: next.from,
           server: String(next.server),
           ep: String(next.ep),
-          back: String(back),
-          q,
-          category,
-          country,
-          year,
-          source,
         },
         { replace },
       );
     },
-    [setParams, back, q, category, country, year, source],
+    [setParams],
   );
 
   useEffect(() => {
@@ -178,7 +159,7 @@ export default function PhimDetail() {
     });
   };
 
-  const backHref = `/?source=${source}&page=${back}&q=${encodeURIComponent(q)}&category=${encodeURIComponent(category)}&country=${encodeURIComponent(country)}&year=${encodeURIComponent(year)}`;
+  const backHref = "/";
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-6">

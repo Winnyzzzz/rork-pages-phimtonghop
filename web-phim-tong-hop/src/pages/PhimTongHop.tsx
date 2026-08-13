@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { MapPin, SlidersHorizontal, Tags, X } from "lucide-react";
 
@@ -11,7 +11,13 @@ import {
   type HubItem,
   type HubSource,
 } from "@/lib/hub";
-import { readListPosition, saveListPosition } from "@/lib/watch-memory";
+import {
+  readListPosition,
+  readListState,
+  saveListPosition,
+  saveListState,
+  type ListState,
+} from "@/lib/watch-memory";
 
 const TABS: { key: HubFeedSource; label: string; color: string }[] = [
   { key: "all", label: "Tất cả nguồn", color: "bg-slate-900" },
@@ -38,28 +44,28 @@ type SearchState = {
   year: string;
 };
 
-function parseSearch(params: URLSearchParams): SearchState {
-  const rawSource = params.get("source");
+function normalizeListState(raw: ListState | null): SearchState {
+  const rawSource = raw?.source ?? "all";
   const source: HubFeedSource =
     rawSource === "all" || (rawSource !== null && SOURCES.includes(rawSource as HubSource))
       ? (rawSource as HubFeedSource)
       : "all";
-  const rawPage = Number(params.get("page") ?? "1");
+  const rawPage = Number(raw?.page ?? 1);
   const page = Number.isFinite(rawPage) ? Math.min(500, Math.max(1, Math.trunc(rawPage))) : 1;
   return {
     source,
     page,
-    q: params.get("q") ?? "",
-    category: params.get("category") ?? "",
-    country: params.get("country") ?? "",
-    year: params.get("year") ?? "",
+    q: typeof raw?.q === "string" ? raw.q : "",
+    category: typeof raw?.category === "string" ? raw.category : "",
+    country: typeof raw?.country === "string" ? raw.country : "",
+    year: typeof raw?.year === "string" ? raw.year : "",
   };
 }
 
 export default function PhimTongHop() {
-  const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
-  const { source, page, q, category, country, year } = parseSearch(params);
+  const [state, setState] = useState<SearchState>(() => normalizeListState(readListState()));
+  const { source, page, q, category, country, year } = state;
   const [qInput, setQInput] = useState<string>(q);
   const [filtersOpen, setFiltersOpen] = useState<boolean>(false);
   const scope = `hub:${source}:${page}:${q}:${category}:${country}:${year}`;
@@ -85,20 +91,9 @@ export default function PhimTongHop() {
   const hasFilter = !!(category || country || year);
   const activeFilterCount = [category, country, year].filter(Boolean).length;
 
-  const goto = useCallback(
-    (patch: Partial<SearchState>): void => {
-      const next: SearchState = { source, page, q, category, country, year, ...patch };
-      setParams({
-        source: next.source,
-        page: String(next.page),
-        q: next.q,
-        category: next.category,
-        country: next.country,
-        year: next.year,
-      });
-    },
-    [source, page, q, category, country, year, setParams],
-  );
+  const goto = useCallback((patch: Partial<SearchState>): void => {
+    setState((current) => ({ ...current, ...patch }));
+  }, []);
 
   const selectedCategory = categories.find((option) => option.slug === category);
   const selectedCountry = countries.find((option) => option.slug === country);
@@ -131,6 +126,10 @@ export default function PhimTongHop() {
   useEffect(() => setQInput(q), [q]);
 
   useEffect(() => {
+    saveListState(state);
+  }, [state]);
+
+  useEffect(() => {
     if (restoredRef.current || items.length === 0) return;
     const pos = readListPosition(scope);
     if (!pos) return;
@@ -145,9 +144,7 @@ export default function PhimTongHop() {
   const openDetail = (item: HubItem): void => {
     const cardId = `${item.source}:${item.slug}`;
     saveListPosition(scope, cardId, window.scrollY);
-    navigate(
-      `/phim/${encodeURIComponent(item.slug)}?from=${item.source}&back=${page}&q=${encodeURIComponent(q)}&category=${encodeURIComponent(category)}&country=${encodeURIComponent(country)}&year=${encodeURIComponent(year)}&source=${source}`,
-    );
+    navigate(`/phim/${encodeURIComponent(item.slug)}?from=${item.source}`);
   };
 
   return (
@@ -223,7 +220,7 @@ export default function PhimTongHop() {
           return (
             <Link
               key={cardId}
-              to={`/phim/${encodeURIComponent(item.slug)}?from=${item.source}&back=${page}&q=${encodeURIComponent(q)}&category=${encodeURIComponent(category)}&country=${encodeURIComponent(country)}&year=${encodeURIComponent(year)}&source=${source}`}
+              to={`/phim/${encodeURIComponent(item.slug)}?from=${item.source}`}
               data-card-id={cardId}
               onClick={(e) => {
                 e.preventDefault();
